@@ -1,0 +1,83 @@
+plugins {
+    id 'java-library'
+    id 'groovy'
+    id 'maven-publish'
+}
+
+group = 'io.nextflow'
+version = '0.1.0-SNAPSHOT'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+repositories {
+    mavenCentral()
+    mavenLocal()
+}
+
+configurations {
+    nextflowRuntime {
+        extendsFrom runtimeClasspath
+    }
+}
+
+dependencies {
+    // Nextflow core dependencies
+    compileOnly 'io.nextflow:nextflow:23.10.1'
+    compileOnly 'org.apache.groovy:groovy:4.0.15'
+    compileOnly 'org.slf4j:slf4j-api:2.0.9'
+    
+    // Plugin framework
+    compileOnly 'org.pf4j:pf4j:3.9.0'
+    
+    // Testing dependencies
+    testImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    testImplementation 'io.nextflow:nextflow:23.10.1'
+    testImplementation 'org.apache.groovy:groovy:4.0.15'
+    testImplementation 'ch.qos.logback:logback-classic:1.4.11'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+compileGroovy {
+    groovyOptions.configurationScript = file('gradle/groovyOptions.groovy')
+}
+
+jar {
+    archiveBaseName = 'nf-bacalhau'
+    manifest {
+        attributes(
+            'Plugin-Class': 'nextflow.bacalhau.BacalhauPlugin',
+            'Plugin-Id': 'nf-bacalhau',
+            'Plugin-Version': version,
+            'Plugin-Provider': 'Nextflow',
+            'Plugin-Description': 'Nextflow executor for Bacalhau distributed compute'
+        )
+    }
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            
+            pom {
+                name = 'Nextflow Bacalhau Executor'
+                description = 'A Nextflow executor plugin for running workflows on Bacalhau'
+                url = 'https://github.com/nextflow-io/nextflow-bacalhau-executor'
+                
+                licenses {
+                    license {
+                        name = 'Apache License, Version 2.0'
+                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+            }
+        }
+    }
+}
