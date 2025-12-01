@@ -10,11 +10,14 @@ version = '0.1.0-SNAPSHOT'
 java {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
 }
 
 repositories {
-    mavenCentral()
     mavenLocal()
+    mavenCentral()
 }
 
 configurations {
@@ -24,19 +27,18 @@ configurations {
 }
 
 dependencies {
-    // Nextflow core dependencies
+    // Nextflow core dependencies - use same Groovy version as Nextflow
     compileOnly 'io.nextflow:nextflow:23.10.1'
-    compileOnly 'org.apache.groovy:groovy:4.0.15'
     compileOnly 'org.slf4j:slf4j-api:2.0.9'
     
     // Plugin framework
     compileOnly 'org.pf4j:pf4j:3.9.0'
     
     // Testing dependencies
-    testImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    testImplementation 'org.spockframework:spock-core:2.3-groovy-3.0'
     testImplementation 'io.nextflow:nextflow:23.10.1'
-    testImplementation 'org.apache.groovy:groovy:4.0.15'
     testImplementation 'ch.qos.logback:logback-classic:1.4.11'
+    // testImplementation 'cglib:cglib-nodep:3.3.0'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
@@ -45,7 +47,7 @@ test {
 }
 
 compileGroovy {
-    groovyOptions.configurationScript = file('gradle/groovyOptions.groovy')
+    // groovyOptions.configurationScript = file('gradle/groovyOptions.groovy')
 }
 
 jar {

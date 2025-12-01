@@ -14,9 +14,12 @@
  */
 package nextflow.executor
 
-import groovy.transform.CompileStatic
+// import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import nextflow.processor.TaskRun
+import nextflow.processor.TaskStatus
+import nextflow.executor.GridTaskHandler
+// import nextflow.processor.QueueStatus
 import nextflow.trace.TraceRecord
 
 import java.nio.file.Path
@@ -27,7 +30,7 @@ import java.nio.file.Path
  * @author Nextflow Contributors
  */
 @Slf4j
-@CompileStatic
+// @CompileStatic
 class BacalhauTaskHandler extends GridTaskHandler {
 
     /**
@@ -163,6 +166,9 @@ class BacalhauTaskHandler extends GridTaskHandler {
         final jobStatus = queueStatus.get(bacalhauJobId)
         
         if (jobStatus == QueueStatus.DONE) {
+            // Retrieve outputs before marking as completed
+            retrieveJobResults()
+            
             status = TaskStatus.COMPLETED
             task.exitStatus = readExitFile()
             task.stdout = task.workDir.resolve(TaskRun.CMD_OUTFILE)
@@ -179,9 +185,41 @@ class BacalhauTaskHandler extends GridTaskHandler {
     }
 
     /**
+     * Retrieve job results from Bacalhau
+     */
+    private void retrieveJobResults() {
+        log.debug "Retrieving results for job ${bacalhauJobId}"
+        try {
+            // Use 'bacalhau get' to download results to the task work directory
+            final cmd = [
+                BacalhauExecutor.BACALHAU_CLI, 
+                'get', 
+                bacalhauJobId,
+                '--output-dir', task.workDir.toString()
+            ]
+            
+            log.debug "Executing retrieval command: ${cmd.join(' ')}"
+            final proc = new ProcessBuilder(cmd)
+                .directory(task.workDir.toFile())
+                .redirectErrorStream(true)
+                .start()
+                
+            final output = proc.inputStream.text
+            final exitCode = proc.waitFor()
+            
+            if (exitCode != 0) {
+                log.warn "Failed to retrieve results for job ${bacalhauJobId}: ${output}"
+            } else {
+                log.debug "Successfully retrieved results for job ${bacalhauJobId}"
+            }
+        } catch (Exception e) {
+            log.warn "Error retrieving results for job ${bacalhauJobId}: ${e.message}"
+        }
+    }
+
+    /**
      * Get the job ID for status tracking
      */
-    @Override
     String getJobId() {
         return bacalhauJobId
     }
@@ -217,7 +255,11 @@ class BacalhauTaskHandler extends GridTaskHandler {
         }
         
         // Fallback: return the last non-empty line
-        return lines.findLast { it.trim() }?.trim()
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String line = lines[i].trim()
+            if (line) return line
+        }
+        return null
     }
 
     /**

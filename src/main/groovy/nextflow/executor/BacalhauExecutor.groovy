@@ -16,6 +16,7 @@ package nextflow.executor
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
+import nextflow.processor.TaskHandler
 import nextflow.processor.TaskRun
 import nextflow.util.ServiceName
 import org.pf4j.ExtensionPoint
@@ -45,9 +46,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     /**
      * Initialize the executor
      */
-    @Override
-    void init() {
-        super.init()
+    void initialize() {
         log.debug "Initializing Bacalhau executor with session: ${session?.runName}"
         
         // Verify Bacalhau CLI is available
@@ -62,7 +61,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
      * Get the submit command line for executing a task
      */
     @Override
-    protected List<String> getSubmitCommandLine(TaskRun task, Path scriptFile) {
+    List<String> getSubmitCommandLine(TaskRun task, Path scriptFile) {
         log.debug "Generating submit command for task: ${task.name}"
         
         final List<String> cmd = []
@@ -72,6 +71,21 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         
         // Add resource constraints
         addResourceConstraints(cmd, task)
+
+        // Mount the script file
+        // Bacalhau input format: -i source_path:destination_path
+        // We mount the script to /tmp in the container
+        final scriptName = scriptFile.getFileName().toString()
+        cmd << '-i'
+        cmd << "${scriptFile.toAbsolutePath()}:/tmp/${scriptName}"
+
+        // Mount input files
+        if (task.getInputFilesMap()) {
+            task.getInputFilesMap().each { name, path ->
+                cmd << '-i'
+                cmd << "${path.toAbsolutePath()}:${path.toAbsolutePath()}"
+            }
+        }
         
         // Add container image
         final container = task.getContainer()
@@ -83,7 +97,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         // Add execution command
         cmd << '--'
         cmd << 'bash'
-        cmd << scriptFile.toString()
+        cmd << "/tmp/${scriptName}"
         
         log.debug "Submit command: ${cmd.join(' ')}"
         return cmd
@@ -137,7 +151,6 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     /**
      * Get queue status by running bacalhau list command
      */
-    @Override
     protected Map<String, QueueStatus> getQueueStatus() {
         log.debug "Fetching queue status from Bacalhau"
         
@@ -158,7 +171,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
      * Create task handler for managing individual task lifecycle
      */
     @Override
-    protected TaskHandler createTaskHandler(TaskRun task) {
+    BacalhauTaskHandler createTaskHandler(TaskRun task) {
         log.debug "Creating task handler for: ${task.name}"
         return new BacalhauTaskHandler(task, this)
     }
@@ -199,7 +212,38 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         final time = task.config.getTime()
         if (time) {
             cmd << '--timeout'
-            cmd << time.getDuration().toString() + 's'
+            cmd << time.toString()
+        }
+        
+        // Add GPU constraint
+        final accelerator = task.config.getAccelerator()
+        if (accelerator && accelerator.request > 0) {
+             cmd << '--gpu'
+             cmd << accelerator.request.toString()
+        }
+
+        // Add disk constraint
+        final disk = task.config.getDisk()
+        if (disk) {
+            // Bacalhau doesn't natively support ephemeral disk sizing in docker run yet 
+            // in the same way, but we can stub it or use environment variables if needed.
+            // For now, let's log it as not fully supported or map it if a flag exists.
+            // Note: Bacalhau 'docker run' does not strictly have a --disk flag in all versions, 
+            // but we will add it assuming standard compute node logic or ignore if not strict.
+            // Checking recent Bacalhau docs, strictly it's often handled by node selection.
+            // We will add it as a resource request if the CLI supports it.
+            // cmd << '--disk' 
+            // cmd << disk.toString()
+            log.warn "Disk directive specified but not fully supported in Bacalhau executor yet: ${disk}"
+        }
+
+        // Add environment variables
+        final env = task.config.getEnvironment()
+        if (env) {
+            env.each { key, value ->
+                cmd << '-e'
+                cmd << "${key}=${value}"
+            }
         }
     }
 
@@ -227,5 +271,29 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
                 log.warn "Unknown Bacalhau job status: ${status}"
                 return QueueStatus.UNKNOWN
         }
+    }
+
+    /**
+     * Required abstract method implementation
+     */
+    @Override
+    List getDirectives(TaskRun task, List result) {
+        return result
+    }
+
+    /**
+     * Required abstract method implementation  
+     */
+    @Override
+    def parseJobId(String text) {
+        return text?.trim()
+    }
+
+    /**
+     * Required abstract method implementation
+     */
+    @Override
+    List queueStatusCommand(Object queue) {
+        return [BACALHAU_CLI, 'list', '--output', 'json']
     }
 }

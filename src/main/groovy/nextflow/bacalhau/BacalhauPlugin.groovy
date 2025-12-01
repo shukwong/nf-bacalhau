@@ -15,7 +15,6 @@
 package nextflow.bacalhau
 
 import groovy.transform.CompileStatic
-import groovy.util.logging.Slf4j
 import org.pf4j.Plugin
 import org.pf4j.PluginWrapper
 
@@ -24,7 +23,6 @@ import org.pf4j.PluginWrapper
  * 
  * @author Nextflow Contributors
  */
-@Slf4j
 @CompileStatic
 class BacalhauPlugin extends Plugin {
 
@@ -34,11 +32,11 @@ class BacalhauPlugin extends Plugin {
 
     @Override
     void start() {
-        log.info "Starting Nextflow Bacalhau plugin ${wrapper.descriptor.version}"
+        // Plugin started
     }
 
     @Override
     void stop() {
-        log.info "Stopping Nextflow Bacalhau plugin"
+        // Plugin stopped
     }
 }

@@ -52,6 +52,10 @@ class BacalhauExecutorTest extends Specification {
                 getMemory() >> null
                 getTime() >> null
             }
+            getInputFilesMap() >> [
+                'file1.txt': Paths.get('/data/file1.txt'),
+                'file2.csv': Paths.get('/data/file2.csv')
+            ]
         }
         def scriptFile = Paths.get('/work/test-script.sh')
 
@@ -63,10 +67,13 @@ class BacalhauExecutorTest extends Specification {
             'bacalhau',
             'docker', 'run',
             '--cpu', '2',
+            '-i', '/work/test-script.sh:/tmp/test-script.sh',
+            '-i', '/data/file1.txt:/data/file1.txt',
+            '-i', '/data/file2.csv:/data/file2.csv',
             'ubuntu:latest',
             '--',
             'bash',
-            '/work/test-script.sh'
+            '/tmp/test-script.sh'
         ]
     }
 
@@ -179,5 +186,34 @@ CREATED              MODIFIED             ID                                    
         executor.parseJobStatus('error') == QueueStatus.ERROR
         executor.parseJobStatus('cancelled') == QueueStatus.ERROR
         executor.parseJobStatus('unknown-status') == QueueStatus.UNKNOWN
+    }
+
+    def 'should generate submit command with GPU and Env vars'() {
+        given:
+        def task = Mock(TaskRun) {
+            getName() >> 'test-task'
+            getContainer() >> 'nvidia/cuda:latest'
+            getConfig() >> Mock(TaskConfig) {
+                getCpus() >> 4
+                getMemory() >> null
+                getTime() >> null
+                getAccelerator() >> {
+                     def acc = Mock(nextflow.util.AcceleratorResource)
+                     acc.request >> 1
+                     return acc
+                }()
+                getEnvironment() >> ['MY_ENV': 'my_val']
+            }
+        }
+        def scriptFile = Paths.get('/work/script.sh')
+
+        when:
+        def cmd = executor.getSubmitCommandLine(task, scriptFile)
+
+        then:
+        cmd.contains('--gpu')
+        cmd.contains('1')
+        cmd.contains('-e')
+        cmd.contains('MY_ENV=my_val')
     }
 }
