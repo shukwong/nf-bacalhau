@@ -88,6 +88,12 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
                     // Syntax: -i src=s3://bucket/key,dst=/inputs/filename
                     cmd << '-i'
                     cmd << "src=${pathStr},dst=/inputs/${name}"
+                } else if (pathStr.startsWith('host://')) {
+                    // Handle Host Path inputs (files existing on remote node)
+                    // Syntax: host:///path/to/file -> src=file:///path/to/file,dst=/inputs/filename
+                    def hostPath = pathStr.substring(7) // Remove 'host://'
+                    cmd << '-i'
+                    cmd << "src=file://${hostPath},dst=/inputs/${name}"
                 } else {
                     // Handle local file inputs
                     cmd << '-i'
