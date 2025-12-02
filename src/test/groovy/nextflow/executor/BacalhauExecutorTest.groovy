@@ -216,4 +216,27 @@ CREATED              MODIFIED             ID                                    
         cmd.contains('-e')
         cmd.contains('MY_ENV=my_val')
     }
+
+    def 'should generate submit command with secrets'() {
+        given:
+        def task = Mock(TaskRun) {
+            getName() >> 'test-task'
+            getContainer() >> 'ubuntu:latest'
+            getConfig() >> Mock(TaskConfig) {
+                getCpus() >> 1
+                getMemory() >> null
+                getTime() >> null
+                getExt() >> ['bacalhauSecrets': ['API_KEY', 'DB_PASS']]
+            }
+        }
+        def scriptFile = Paths.get('/work/script.sh')
+
+        when:
+        def cmd = executor.getSubmitCommandLine(task, scriptFile)
+
+        then:
+        cmd.contains('--secret')
+        cmd.contains('env=API_KEY')
+        cmd.contains('env=DB_PASS')
+    }
 }

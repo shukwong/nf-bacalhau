@@ -82,8 +82,17 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         // Mount input files
         if (task.getInputFilesMap()) {
             task.getInputFilesMap().each { name, path ->
-                cmd << '-i'
-                cmd << "${path.toAbsolutePath()}:${path.toAbsolutePath()}"
+                def pathStr = path.toString()
+                if (pathStr.startsWith('s3://')) {
+                    // Handle S3 inputs natively
+                    // Syntax: -i src=s3://bucket/key,dst=/inputs/filename
+                    cmd << '-i'
+                    cmd << "src=${pathStr},dst=/inputs/${name}"
+                } else {
+                    // Handle local file inputs
+                    cmd << '-i'
+                    cmd << "${path.toAbsolutePath()}:${path.toAbsolutePath()}"
+                }
             }
         }
         
@@ -243,6 +252,25 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
             env.each { key, value ->
                 cmd << '-e'
                 cmd << "${key}=${value}"
+            }
+        }
+
+        // Add secrets from configuration
+        // We look for 'bacalhauSecrets' in the process 'ext' block
+        // Format expected: ext.bacalhauSecrets = ['MY_ENV_VAR', 'ANOTHER_SECRET']
+        final extConfig = task.config.getExt()
+        if (extConfig && extConfig.containsKey('bacalhauSecrets')) {
+            final secrets = extConfig.get('bacalhauSecrets')
+            if (secrets instanceof List) {
+                secrets.each { secretName ->
+                    // Bacalhau CLI format: --secret env=VAR_NAME
+                    cmd << '--secret'
+                    cmd << "env=${secretName}"
+                }
+            } else if (secrets instanceof String) {
+                // Handle single secret definition
+                cmd << '--secret'
+                cmd << "env=${secrets}"
             }
         }
     }
