@@ -15,14 +15,16 @@
 package nextflow.bacalhau
 
 import groovy.transform.CompileStatic
+import groovy.util.logging.Slf4j
 import org.pf4j.Plugin
 import org.pf4j.PluginWrapper
 
 /**
  * Nextflow plugin for Bacalhau distributed compute integration
- * 
+ *
  * @author Nextflow Contributors
  */
+@Slf4j
 @CompileStatic
 class BacalhauPlugin extends Plugin {
 
@@ -32,11 +34,11 @@ class BacalhauPlugin extends Plugin {
 
     @Override
     void start() {
-        // Plugin started
+        log.info("Bacalhau plugin started")
     }
 
     @Override
     void stop() {
-        // Plugin stopped
+        log.info("Bacalhau plugin stopped")
     }
 }

@@ -44,17 +44,73 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     static final String DEFAULT_API_ENDPOINT = 'https://api.bacalhau.org'
 
     /**
+     * Default job submission timeout in seconds
+     */
+    static final int DEFAULT_SUBMIT_TIMEOUT = 300
+
+    /**
+     * Configuration parameters
+     */
+    private String bacalhauCliPath
+    private String bacalhauNode
+    private Boolean waitForCompletion
+    private Integer maxRetries
+    private String storageEngine
+
+    /**
      * Initialize the executor
      */
     void initialize() {
         log.debug "Initializing Bacalhau executor with session: ${session?.runName}"
-        
+
+        // Load configuration from process.ext or session config
+        loadConfiguration()
+
         // Verify Bacalhau CLI is available
         if (!isBacalhauAvailable()) {
             throw new IllegalStateException("Bacalhau CLI not found in PATH. Please install Bacalhau: https://docs.bacalhau.org/getting-started/installation")
         }
-        
-        log.info "Bacalhau executor initialized successfully"
+
+        log.info "Bacalhau executor initialized successfully with node: ${bacalhauNode}"
+    }
+
+    /**
+     * Load and validate configuration
+     */
+    private void loadConfiguration() {
+        // Load from session config if available
+        final config = session?.config?.process as Map ?: [:]
+        final extConfig = config?.ext as Map ?: [:]
+
+        // Bacalhau CLI path (default to 'bacalhau' in PATH)
+        bacalhauCliPath = extConfig.bacalhauCliPath ?: BACALHAU_CLI
+
+        // Bacalhau API node endpoint
+        bacalhauNode = extConfig.bacalhauNode ?: DEFAULT_API_ENDPOINT
+
+        // Wait for completion mode (default: true)
+        waitForCompletion = extConfig.waitForCompletion != null ? extConfig.waitForCompletion : true
+
+        // Max retries for failed jobs (default: 3)
+        maxRetries = extConfig.maxRetries ?: 3
+        if (maxRetries < 0) {
+            throw new IllegalArgumentException("maxRetries must be non-negative, got: ${maxRetries}")
+        }
+
+        // Storage engine (default: auto-detect)
+        storageEngine = extConfig.storageEngine ?: 'ipfs'
+        if (storageEngine && !['ipfs', 's3', 'local'].contains(storageEngine)) {
+            log.warn "Unknown storage engine: ${storageEngine}, using default"
+        }
+
+        log.debug "Configuration loaded - CLI: ${bacalhauCliPath}, Node: ${bacalhauNode}, MaxRetries: ${maxRetries}"
+    }
+
+    /**
+     * Get the configured Bacalhau CLI path
+     */
+    String getBacalhauCli() {
+        return bacalhauCliPath ?: BACALHAU_CLI
     }
 
     /**
@@ -63,9 +119,9 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     @Override
     List<String> getSubmitCommandLine(TaskRun task, Path scriptFile) {
         log.debug "Generating submit command for task: ${task.name}"
-        
+
         final List<String> cmd = []
-        cmd << BACALHAU_CLI
+        cmd << getBacalhauCli()
         cmd << 'docker'
         cmd << 'run'
         
@@ -95,9 +151,10 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
                     cmd << '-i'
                     cmd << "src=file://${hostPath},dst=/inputs/${name}"
                 } else {
-                    // Handle local file inputs
+                    // Handle local file inputs - mount to /inputs directory
+                    // Syntax: local_path:/inputs/filename
                     cmd << '-i'
-                    cmd << "${path.toAbsolutePath()}:${path.toAbsolutePath()}"
+                    cmd << "${path.toAbsolutePath()}:/inputs/${name}"
                 }
             }
         }
@@ -123,7 +180,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
      */
     @Override
     protected List<String> getKillCommand() {
-        return [BACALHAU_CLI, 'job', 'stop']
+        return [getBacalhauCli(), 'job', 'stop']
     }
 
     /**
@@ -135,31 +192,38 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     }
 
     /**
-     * Parse queue status from Bacalhau output
+     * Parse queue status from Bacalhau JSON output
      */
     @Override
     protected Map<String, QueueStatus> parseQueueStatus(String text) {
-        log.debug "Parsing queue status from Bacalhau output"
-        
+        log.debug "Parsing queue status from Bacalhau JSON output"
+
         final Map<String, QueueStatus> result = [:]
-        
+
         if (!text?.trim()) {
             return result
         }
-        
-        // Parse bacalhau list output format
-        // Expected format: JOB_ID   CREATED   MODIFIED   STATUS
-        text.split('\n').each { line ->
-            if (line && !line.startsWith('CREATED') && !line.trim().isEmpty()) {
-                final parts = line.split(/\s+/)
-                if (parts.length >= 4) {
-                    final jobId = parts[0]
-                    final status = parts[3]
+
+        try {
+            // Parse JSON output from bacalhau list
+            def jsonSlurper = new groovy.json.JsonSlurper()
+            def jobs = jsonSlurper.parseText(text)
+
+            // Handle both array and single object responses
+            def jobList = jobs instanceof List ? jobs : [jobs]
+
+            jobList.each { job ->
+                if (job.ID) {
+                    final jobId = job.ID as String
+                    final status = job.State?.StateType as String
                     result[jobId] = parseJobStatus(status)
                 }
             }
+        } catch (Exception e) {
+            log.warn "Failed to parse queue status JSON: ${e.message}"
+            log.debug "JSON content: ${text}"
         }
-        
+
         return result
     }
 
@@ -168,13 +232,18 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
      */
     protected Map<String, QueueStatus> getQueueStatus() {
         log.debug "Fetching queue status from Bacalhau"
-        
+
         try {
-            final cmd = [BACALHAU_CLI, 'list', '--output', 'table', '--no-header']
+            final cmd = [getBacalhauCli(), 'job', 'list', '--output', 'json']
             final proc = new ProcessBuilder(cmd).start()
             final output = proc.inputStream.text
-            proc.waitFor()
-            
+            final exitCode = proc.waitFor()
+
+            if (exitCode != 0) {
+                log.warn "Failed to get queue status, exit code: ${exitCode}"
+                return [:]
+            }
+
             return parseQueueStatus(output)
         } catch (Exception e) {
             log.warn "Failed to get queue status: ${e.message}"
@@ -196,9 +265,13 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
      */
     private boolean isBacalhauAvailable() {
         try {
-            final proc = new ProcessBuilder([BACALHAU_CLI, 'version']).start()
+            final proc = new ProcessBuilder([getBacalhauCli(), 'version']).start()
             final exitCode = proc.waitFor()
-            return exitCode == 0
+            if (exitCode == 0) {
+                log.debug "Bacalhau CLI found at: ${getBacalhauCli()}"
+                return true
+            }
+            return false
         } catch (Exception e) {
             log.debug "Bacalhau CLI check failed: ${e.message}"
             return false
@@ -214,51 +287,52 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         if (cpus && cpus > 0) {
             cmd << '--cpu'
             cmd << cpus.toString()
+            log.debug "Task ${task.name}: Setting CPU constraint to ${cpus}"
         }
-        
+
         // Add memory constraint
         final memory = task.config.getMemory()
         if (memory) {
             cmd << '--memory'
             cmd << memory.toString()
+            log.debug "Task ${task.name}: Setting memory constraint to ${memory}"
         }
-        
+
         // Add timeout if specified
         final time = task.config.getTime()
         if (time) {
             cmd << '--timeout'
             cmd << time.toString()
+            log.debug "Task ${task.name}: Setting timeout to ${time}"
         }
-        
+
         // Add GPU constraint
         final accelerator = task.config.getAccelerator()
         if (accelerator && accelerator.request > 0) {
-             cmd << '--gpu'
-             cmd << accelerator.request.toString()
+            cmd << '--gpu'
+            cmd << accelerator.request.toString()
+            log.debug "Task ${task.name}: Setting GPU constraint to ${accelerator.request}"
         }
 
-        // Add disk constraint
+        // Disk constraints are not supported in Bacalhau docker run
         final disk = task.config.getDisk()
         if (disk) {
-            // Bacalhau doesn't natively support ephemeral disk sizing in docker run yet 
-            // in the same way, but we can stub it or use environment variables if needed.
-            // For now, let's log it as not fully supported or map it if a flag exists.
-            // Note: Bacalhau 'docker run' does not strictly have a --disk flag in all versions, 
-            // but we will add it assuming standard compute node logic or ignore if not strict.
-            // Checking recent Bacalhau docs, strictly it's often handled by node selection.
-            // We will add it as a resource request if the CLI supports it.
-            // cmd << '--disk' 
-            // cmd << disk.toString()
-            log.warn "Disk directive specified but not fully supported in Bacalhau executor yet: ${disk}"
+            log.warn "Task ${task.name}: Disk directive specified (${disk}) but not supported in Bacalhau executor"
         }
 
-        // Add environment variables
+        // Add environment variables with validation
         final env = task.config.getEnvironment()
         if (env) {
             env.each { key, value ->
+                // Basic validation to prevent command injection
+                if (key && !key.toString().matches(/^[A-Za-z_][A-Za-z0-9_]*$/)) {
+                    log.warn "Task ${task.name}: Skipping invalid environment variable name: ${key}"
+                    return
+                }
                 cmd << '-e'
                 cmd << "${key}=${value}"
             }
+            log.debug "Task ${task.name}: Added ${env.size()} environment variables"
         }
 
         // Add secrets from configuration
@@ -269,14 +343,23 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
             final secrets = extConfig.get('bacalhauSecrets')
             if (secrets instanceof List) {
                 secrets.each { secretName ->
-                    // Bacalhau CLI format: --secret env=VAR_NAME
-                    cmd << '--secret'
-                    cmd << "env=${secretName}"
+                    // Validate secret name format
+                    if (secretName && secretName.toString().matches(/^[A-Za-z_][A-Za-z0-9_]*$/)) {
+                        cmd << '--secret'
+                        cmd << "env=${secretName}"
+                    } else {
+                        log.warn "Task ${task.name}: Skipping invalid secret name: ${secretName}"
+                    }
                 }
+                log.debug "Task ${task.name}: Added ${secrets.size()} secrets"
             } else if (secrets instanceof String) {
                 // Handle single secret definition
-                cmd << '--secret'
-                cmd << "env=${secrets}"
+                if (secrets.matches(/^[A-Za-z_][A-Za-z0-9_]*$/)) {
+                    cmd << '--secret'
+                    cmd << "env=${secrets}"
+                } else {
+                    log.warn "Task ${task.name}: Skipping invalid secret name: ${secrets}"
+                }
             }
         }
     }
@@ -328,6 +411,6 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
      */
     @Override
     List queueStatusCommand(Object queue) {
-        return [BACALHAU_CLI, 'list', '--output', 'json']
+        return [getBacalhauCli(), 'job', 'list', '--output', 'json']
     }
 }
