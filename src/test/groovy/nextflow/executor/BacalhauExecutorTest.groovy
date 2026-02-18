@@ -17,15 +17,20 @@ package nextflow.executor
 import nextflow.Session
 import nextflow.processor.TaskConfig
 import nextflow.processor.TaskRun
+import nextflow.util.MemoryUnit
 import spock.lang.Specification
 import spock.lang.Subject
+import spock.lang.TempDir
 
-import java.nio.file.Paths
+import java.nio.file.Path
 
 /**
- * Unit tests for BacalhauExecutor
+ * Unit tests for BacalhauExecutor.
  */
 class BacalhauExecutorTest extends Specification {
+
+    @TempDir
+    Path tempDir
 
     @Subject
     BacalhauExecutor executor
@@ -37,79 +42,199 @@ class BacalhauExecutorTest extends Specification {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Service registration
+    // -------------------------------------------------------------------------
+
     def 'should have correct service name'() {
         expect:
         BacalhauExecutor.getAnnotation(nextflow.util.ServiceName).value() == 'bacalhau'
     }
 
-    def 'should generate correct submit command'() {
-        given:
+    // -------------------------------------------------------------------------
+    // Command generation — FIX #1 + #4
+    //
+    // getSubmitCommandLine() now writes a YAML spec to task.workDir and
+    // returns ['bacalhau', 'job', 'run', <specFilePath>].
+    // We verify the command structure and the YAML content.
+    // -------------------------------------------------------------------------
+
+    def 'should generate correct submit command using bacalhau job run'() {
+        given: 'a task with CPU constraints and two local input files'
         def task = Mock(TaskRun) {
             getName() >> 'test-task'
             getContainer() >> 'ubuntu:latest'
+            getWorkDir() >> tempDir
             getConfig() >> Mock(TaskConfig) {
-                getCpus() >> 2
-                getMemory() >> null
-                getTime() >> null
+                getCpus()        >> 2
+                getMemory()      >> null
+                getTime()        >> null
+                getDisk()        >> null
+                getAccelerator() >> null
+                getEnvironment() >> null
+                getExt()         >> null
             }
             getInputFilesMap() >> [
-                'file1.txt': Paths.get('/data/file1.txt'),
-                'file2.csv': Paths.get('/data/file2.csv')
+                'file1.txt': tempDir.resolve('file1.txt'),
+                'file2.csv': tempDir.resolve('file2.csv')
             ]
         }
-        def scriptFile = Paths.get('/work/test-script.sh')
+        def scriptFile = tempDir.resolve('test-script.sh')
 
         when:
         def cmd = executor.getSubmitCommandLine(task, scriptFile)
 
-        then:
-        cmd == [
-            'bacalhau',
-            'docker', 'run',
-            '--cpu', '2',
-            '-i', '/work/test-script.sh:/tmp/test-script.sh',
-            '-i', '/data/file1.txt:/data/file1.txt',
-            '-i', '/data/file2.csv:/data/file2.csv',
-            'ubuntu:latest',
-            '--',
-            'bash',
-            '/tmp/test-script.sh'
-        ]
+        then: 'command uses the new bacalhau job run sub-command (not deprecated docker run)'
+        cmd[0] == 'bacalhau'
+        cmd[1] == 'job'
+        cmd[2] == 'run'
+
+        and: 'the last argument points to the YAML spec file written in the work dir'
+        cmd.last().endsWith('.bacalhau-job.yaml')
+
+        and: 'the YAML file was created in the task work directory'
+        tempDir.resolve('.bacalhau-job.yaml').exists()
     }
 
-    def 'should generate submit command with memory constraint'() {
+    def 'should embed correct container image in the YAML spec'() {
         given:
         def task = Mock(TaskRun) {
             getName() >> 'test-task'
             getContainer() >> 'alpine:latest'
+            getWorkDir() >> tempDir
             getConfig() >> Mock(TaskConfig) {
-                getCpus() >> 1
-                getMemory() >> { 
-                    def memory = Mock()
-                    memory.toString() >> '4GB'
-                    return memory
-                }()
-                getTime() >> null
+                getCpus()        >> 1
+                getMemory()      >> null
+                getTime()        >> null
+                getDisk()        >> null
+                getAccelerator() >> null
+                getEnvironment() >> null
+                getExt()         >> null
             }
+            getInputFilesMap() >> [:]
         }
-        def scriptFile = Paths.get('/work/script.sh')
+        def scriptFile = tempDir.resolve('run.sh')
 
         when:
-        def cmd = executor.getSubmitCommandLine(task, scriptFile)
+        executor.getSubmitCommandLine(task, scriptFile)
+        def yaml = tempDir.resolve('.bacalhau-job.yaml').text
 
         then:
-        cmd.contains('--memory')
-        cmd.contains('4GB')
-        cmd.contains('alpine:latest')
+        yaml.contains('Image: "alpine:latest"')
+    }
+
+    def 'should embed memory resource in the YAML spec in Bacalhau format'() {
+        // FIX #7: memory must be "4gb" not "4 GB"
+        given:
+        def memory = Mock(MemoryUnit) {
+            // 4 GB in bytes
+            toBytes() >> 4_294_967_296L
+        }
+        def task = Mock(TaskRun) {
+            getName() >> 'test-task'
+            getContainer() >> 'alpine:latest'
+            getWorkDir() >> tempDir
+            getConfig() >> Mock(TaskConfig) {
+                getCpus()        >> 1
+                getMemory()      >> memory
+                getTime()        >> null
+                getDisk()        >> null
+                getAccelerator() >> null
+                getEnvironment() >> null
+                getExt()         >> null
+            }
+            getInputFilesMap() >> [:]
+        }
+        def scriptFile = tempDir.resolve('run.sh')
+
+        when:
+        executor.getSubmitCommandLine(task, scriptFile)
+        def yaml = tempDir.resolve('.bacalhau-job.yaml').text
+
+        then:
+        yaml.contains('Memory: "4gb"')
+        !yaml.contains('4 GB')   // old broken format must not appear
+    }
+
+    def 'should embed input files as localDirectory InputSources in YAML'() {
+        // FIX #1: destinations are /inputs/<name>, not the source path
+        // FIX #9: a single consistent YAML format replaces mixed CLI flags
+        given:
+        def task = Mock(TaskRun) {
+            getName() >> 'test-task'
+            getContainer() >> 'ubuntu:latest'
+            getWorkDir() >> tempDir
+            getConfig() >> Mock(TaskConfig) {
+                getCpus()        >> 1
+                getMemory()      >> null
+                getTime()        >> null
+                getDisk()        >> null
+                getAccelerator() >> null
+                getEnvironment() >> null
+                getExt()         >> null
+            }
+            getInputFilesMap() >> [
+                'file1.txt': Path.of('/data/file1.txt'),
+                'file2.csv': Path.of('/data/file2.csv')
+            ]
+        }
+        def scriptFile = tempDir.resolve('script.sh')
+
+        when:
+        executor.getSubmitCommandLine(task, scriptFile)
+        def yaml = tempDir.resolve('.bacalhau-job.yaml').text
+
+        then: 'each file gets a localDirectory source entry with the correct /inputs/<name> target'
+        yaml.contains('SourcePath: "/data/file1.txt"')
+        yaml.contains('Target: "/inputs/file1.txt"')
+        yaml.contains('SourcePath: "/data/file2.csv"')
+        yaml.contains('Target: "/inputs/file2.csv"')
+
+        and: 'no legacy colon-separated or src=,dst= syntax'
+        !yaml.contains(':/inputs/')
+        !yaml.contains('src=')
+    }
+
+    def 'should embed S3 inputs as s3 InputSources in YAML'() {
+        given:
+        def task = Mock(TaskRun) {
+            getName() >> 'test-task'
+            getContainer() >> 'ubuntu:latest'
+            getWorkDir() >> tempDir
+            getConfig() >> Mock(TaskConfig) {
+                getCpus()        >> 1
+                getMemory()      >> null
+                getTime()        >> null
+                getDisk()        >> null
+                getAccelerator() >> null
+                getEnvironment() >> null
+                getExt()         >> null
+            }
+            getInputFilesMap() >> [
+                'data.csv': Path.of('s3://my-bucket/path/to/data.csv')
+            ]
+        }
+        def scriptFile = tempDir.resolve('script.sh')
+
+        when:
+        executor.getSubmitCommandLine(task, scriptFile)
+        def yaml = tempDir.resolve('.bacalhau-job.yaml').text
+
+        then:
+        yaml.contains('Type: s3')
+        yaml.contains('Bucket: "my-bucket"')
+        yaml.contains('Key: "path/to/data.csv"')
+        yaml.contains('Target: "/inputs/data.csv"')
     }
 
     def 'should throw exception for task without container'() {
         given:
         def task = Mock(TaskRun) {
-            getName() >> 'test-task'
+            getName()     >> 'test-task'
             getContainer() >> null
+            getWorkDir()  >> tempDir
         }
-        def scriptFile = Paths.get('/work/script.sh')
+        def scriptFile = tempDir.resolve('script.sh')
 
         when:
         executor.getSubmitCommandLine(task, scriptFile)
@@ -119,6 +244,10 @@ class BacalhauExecutorTest extends Specification {
         e.message.contains('requires a container image')
     }
 
+    // -------------------------------------------------------------------------
+    // Kill command
+    // -------------------------------------------------------------------------
+
     def 'should return correct kill command'() {
         when:
         def cmd = executor.getKillCommand()
@@ -127,16 +256,28 @@ class BacalhauExecutorTest extends Specification {
         cmd == ['bacalhau', 'job', 'stop']
     }
 
-    def 'should parse job status correctly'() {
-        given:
-        def output = '''
-CREATED              MODIFIED             ID                                      STATE
-2024-01-15T10:30:45Z 2024-01-15T10:31:20Z job-12345678-abcd-1234-5678-123456789012 completed
-2024-01-15T10:25:10Z 2024-01-15T10:30:45Z job-87654321-dcba-4321-8765-210987654321 running
-'''
+    // -------------------------------------------------------------------------
+    // Queue status parsing — FIX #2
+    //
+    // parseQueueStatus() uses JsonSlurper; the test must supply JSON, not the
+    // old tabular/space-separated text.
+    // -------------------------------------------------------------------------
+
+    def 'should parse job status from Bacalhau JSON output'() {
+        given: 'valid JSON from bacalhau job list --output json'
+        def json = '''[
+            {
+                "ID": "job-12345678-abcd-1234-5678-123456789012",
+                "State": { "StateType": "completed" }
+            },
+            {
+                "ID": "job-87654321-dcba-4321-8765-210987654321",
+                "State": { "StateType": "running" }
+            }
+        ]'''
 
         when:
-        def result = executor.parseQueueStatus(output)
+        def result = executor.parseQueueStatus(json)
 
         then:
         result.size() == 2
@@ -144,19 +285,28 @@ CREATED              MODIFIED             ID                                    
         result['job-87654321-dcba-4321-8765-210987654321'] == QueueStatus.RUNNING
     }
 
-    def 'should handle empty queue status'() {
+    def 'should handle empty or null queue status input'() {
         when:
         def result = executor.parseQueueStatus('')
-
         then:
         result.isEmpty()
 
         when:
         result = executor.parseQueueStatus(null)
-
         then:
         result.isEmpty()
     }
+
+    def 'should return empty map for invalid JSON input'() {
+        when:
+        def result = executor.parseQueueStatus('not-json-at-all')
+        then:
+        result.isEmpty()
+    }
+
+    // -------------------------------------------------------------------------
+    // Task handler factory
+    // -------------------------------------------------------------------------
 
     def 'should create task handler'() {
         given:
@@ -171,72 +321,104 @@ CREATED              MODIFIED             ID                                    
         handler.executor == executor
     }
 
-    def 'should map job statuses correctly'() {
-        given:
-        def executor = new BacalhauExecutor()
+    // -------------------------------------------------------------------------
+    // Job status mapping — FIX #3
+    //
+    // parseJobStatus() is now protected, so this test can call it directly
+    // without a compile-time access violation under @CompileStatic.
+    // -------------------------------------------------------------------------
 
+    def 'should map all Bacalhau job states to Nextflow QueueStatus'() {
         expect:
-        executor.parseJobStatus('queued') == QueueStatus.PENDING
-        executor.parseJobStatus('pending') == QueueStatus.PENDING
-        executor.parseJobStatus('running') == QueueStatus.RUNNING
+        executor.parseJobStatus('queued')    == QueueStatus.PENDING
+        executor.parseJobStatus('pending')   == QueueStatus.PENDING
+        executor.parseJobStatus('running')   == QueueStatus.RUNNING
         executor.parseJobStatus('executing') == QueueStatus.RUNNING
         executor.parseJobStatus('completed') == QueueStatus.DONE
-        executor.parseJobStatus('finished') == QueueStatus.DONE
-        executor.parseJobStatus('failed') == QueueStatus.ERROR
-        executor.parseJobStatus('error') == QueueStatus.ERROR
+        executor.parseJobStatus('finished')  == QueueStatus.DONE
+        executor.parseJobStatus('failed')    == QueueStatus.ERROR
+        executor.parseJobStatus('error')     == QueueStatus.ERROR
         executor.parseJobStatus('cancelled') == QueueStatus.ERROR
-        executor.parseJobStatus('unknown-status') == QueueStatus.UNKNOWN
+        executor.parseJobStatus('stopped')   == QueueStatus.ERROR
+        executor.parseJobStatus('unknown-x') == QueueStatus.UNKNOWN
+        executor.parseJobStatus(null)        == QueueStatus.UNKNOWN
     }
 
-    def 'should generate submit command with GPU and Env vars'() {
+    // -------------------------------------------------------------------------
+    // GPU and environment variables
+    // -------------------------------------------------------------------------
+
+    def 'should embed GPU and environment variables in YAML spec'() {
         given:
+        def accelerator = Mock(nextflow.util.AcceleratorResource) {
+            getRequest() >> 1
+        }
         def task = Mock(TaskRun) {
-            getName() >> 'test-task'
+            getName() >> 'gpu-task'
             getContainer() >> 'nvidia/cuda:latest'
+            getWorkDir() >> tempDir
             getConfig() >> Mock(TaskConfig) {
-                getCpus() >> 4
-                getMemory() >> null
-                getTime() >> null
-                getAccelerator() >> {
-                     def acc = Mock(nextflow.util.AcceleratorResource)
-                     acc.request >> 1
-                     return acc
-                }()
+                getCpus()        >> 4
+                getMemory()      >> null
+                getTime()        >> null
+                getDisk()        >> null
+                getAccelerator() >> accelerator
                 getEnvironment() >> ['MY_ENV': 'my_val']
+                getExt()         >> null
             }
+            getInputFilesMap() >> [:]
         }
-        def scriptFile = Paths.get('/work/script.sh')
+        def scriptFile = tempDir.resolve('script.sh')
 
         when:
-        def cmd = executor.getSubmitCommandLine(task, scriptFile)
+        executor.getSubmitCommandLine(task, scriptFile)
+        def yaml = tempDir.resolve('.bacalhau-job.yaml').text
 
         then:
-        cmd.contains('--gpu')
-        cmd.contains('1')
-        cmd.contains('-e')
-        cmd.contains('MY_ENV=my_val')
+        yaml.contains('GPU: "1"')
+        yaml.contains('MY_ENV: "my_val"')
     }
 
-    def 'should generate submit command with secrets'() {
+    // -------------------------------------------------------------------------
+    // Secrets
+    // -------------------------------------------------------------------------
+
+    def 'should embed secrets as env placeholders in YAML spec'() {
         given:
         def task = Mock(TaskRun) {
-            getName() >> 'test-task'
+            getName() >> 'secret-task'
             getContainer() >> 'ubuntu:latest'
+            getWorkDir() >> tempDir
             getConfig() >> Mock(TaskConfig) {
-                getCpus() >> 1
-                getMemory() >> null
-                getTime() >> null
-                getExt() >> ['bacalhauSecrets': ['API_KEY', 'DB_PASS']]
+                getCpus()        >> 1
+                getMemory()      >> null
+                getTime()        >> null
+                getDisk()        >> null
+                getAccelerator() >> null
+                getEnvironment() >> null
+                getExt()         >> ['bacalhauSecrets': ['API_KEY', 'DB_PASS']]
             }
+            getInputFilesMap() >> [:]
         }
-        def scriptFile = Paths.get('/work/script.sh')
+        def scriptFile = tempDir.resolve('script.sh')
 
         when:
-        def cmd = executor.getSubmitCommandLine(task, scriptFile)
+        executor.getSubmitCommandLine(task, scriptFile)
+        def yaml = tempDir.resolve('.bacalhau-job.yaml').text
 
         then:
-        cmd.contains('--secret')
-        cmd.contains('env=API_KEY')
-        cmd.contains('env=DB_PASS')
+        yaml.contains('API_KEY')
+        yaml.contains('DB_PASS')
+    }
+
+    // -------------------------------------------------------------------------
+    // Memory formatter (FIX #7)
+    // -------------------------------------------------------------------------
+
+    def 'formatMemory should produce Bacalhau-compatible compact strings'() {
+        expect:
+        executor.formatMemory(new MemoryUnit(4_294_967_296L)) == '4gb'    // 4 GiB
+        executor.formatMemory(new MemoryUnit(536_870_912L))   == '512mb'  // 512 MiB
+        executor.formatMemory(new MemoryUnit(1_073_741_824L)) == '1gb'    // 1 GiB
     }
 }
