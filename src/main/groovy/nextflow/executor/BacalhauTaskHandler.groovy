@@ -18,14 +18,12 @@ import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
-import nextflow.executor.GridTaskHandler
 import nextflow.trace.TraceRecord
 
-import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
 /**
- * Task handler for managing individual Bacalhau job lifecycle
+ * Task handler for managing individual Bacalhau job lifecycle.
  *
  * @author Nextflow Contributors
  */
@@ -33,32 +31,46 @@ import java.util.concurrent.TimeUnit
 @CompileStatic
 class BacalhauTaskHandler extends GridTaskHandler {
 
-    /**
-     * Bacalhau job ID for this task
-     */
+    /** Bacalhau job ID assigned after successful submission */
     private String bacalhauJobId
 
-    /**
-     * Flag to track if job has been submitted
-     */
+    /** Set to true once submit() has succeeded */
     private volatile boolean jobSubmitted = false
 
     /**
-     * Constructor
+     * FIX #8: Result retrieval is now performed on a dedicated background
+     * thread so that {@link #checkIfCompleted()} does not block the Nextflow
+     * task-polling monitor for up to 5 minutes per job.
+     *
+     * The flag is set by the retrieval thread when it finishes (success or
+     * failure), after which {@code checkIfCompleted()} may advance the task
+     * state and return {@code true}.
      */
+    private volatile boolean retrievalStarted   = false
+    private volatile boolean retrievalCompleted = false
+
+    // -------------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------------
+
     BacalhauTaskHandler(TaskRun task, BacalhauExecutor executor) {
         super(task, executor)
     }
 
-    /**
-     * Get the Bacalhau executor instance
-     */
     protected BacalhauExecutor getBacalhauExecutor() {
         return (BacalhauExecutor) executor
     }
 
+    // -------------------------------------------------------------------------
+    // TaskHandler API
+    // -------------------------------------------------------------------------
+
     /**
-     * Submit the task to Bacalhau
+     * Submit the task to Bacalhau.
+     *
+     * Runs {@code bacalhau job run <spec-file>}, waits up to
+     * {@link BacalhauExecutor#DEFAULT_SUBMIT_TIMEOUT} seconds for it to
+     * finish, then extracts the job ID from the output.
      */
     @Override
     void submit() {
@@ -66,65 +78,55 @@ class BacalhauTaskHandler extends GridTaskHandler {
 
         Process proc = null
         try {
-            // Create the task script
             final scriptFile = task.workDir.resolve(TaskRun.CMD_SCRIPT)
+            final cmd        = getBacalhauExecutor().getSubmitCommandLine(task, scriptFile)
 
-            // Get the submit command from executor
-            final cmd = getBacalhauExecutor().getSubmitCommandLine(task, scriptFile)
-
-            // Execute the submit command with timeout
-            log.info "Submitting task ${task.name} with command: ${cmd.join(' ')}"
+            log.info "Submitting task ${task.name}: ${cmd.join(' ')}"
             proc = new ProcessBuilder(cmd)
                 .directory(task.workDir.toFile())
-                .redirectErrorStream(false)  // Keep stdout and stderr separate
+                .redirectErrorStream(false)
                 .start()
 
-            // Read stdout and stderr separately with timeout
             final StringBuilder stdout = new StringBuilder()
             final StringBuilder stderr = new StringBuilder()
 
-            // Start threads to consume streams to prevent blocking
-            final Thread stdoutThread = Thread.start {
-                proc.inputStream.eachLine { line -> stdout.append(line).append('\n') }
-            }
-            final Thread stderrThread = Thread.start {
-                proc.errorStream.eachLine { line -> stderr.append(line).append('\n') }
-            }
+            // Consume both streams in background to prevent pipe-buffer deadlock
+            final Thread stdoutThread = Thread.start { proc.inputStream.eachLine { stdout.append(it).append('\n') } }
+            final Thread stderrThread = Thread.start { proc.errorStream.eachLine { stderr.append(it).append('\n') } }
 
-            // Wait for process with timeout
-            final timeout = BacalhauExecutor.DEFAULT_SUBMIT_TIMEOUT
-            boolean finished = proc.waitFor(timeout, TimeUnit.SECONDS)
+            final int timeout       = BacalhauExecutor.DEFAULT_SUBMIT_TIMEOUT
+            final boolean finished  = proc.waitFor(timeout, TimeUnit.SECONDS)
 
-            // Wait for stream readers to complete
-            stdoutThread.join(5000)
-            stderrThread.join(5000)
+            stdoutThread.join(5_000)
+            stderrThread.join(5_000)
 
             if (!finished) {
                 proc.destroyForcibly()
-                throw new IllegalStateException("Bacalhau job submission timed out after ${timeout} seconds for task ${task.name}")
+                throw new IllegalStateException(
+                    "Bacalhau job submission timed out after ${timeout} s for task ${task.name}")
             }
 
-            final exitCode = proc.exitValue()
-            final output = stdout.toString().trim()
-            final errorOutput = stderr.toString().trim()
+            final int    exitCode    = proc.exitValue()
+            final String output      = stdout.toString().trim()
+            final String errorOutput = stderr.toString().trim()
 
             if (exitCode != 0) {
-                log.error "Task ${task.name} submission failed. Exit code: ${exitCode}"
-                log.error "Stdout: ${output}"
-                log.error "Stderr: ${errorOutput}"
-                throw new IllegalStateException("Bacalhau job submission failed with exit code ${exitCode}: ${errorOutput ?: output}")
+                log.error "Task ${task.name} submission failed (exit ${exitCode})"
+                log.error "stdout: ${output}"
+                log.error "stderr: ${errorOutput}"
+                throw new IllegalStateException(
+                    "Bacalhau job submission failed with exit code ${exitCode}: ${errorOutput ?: output}")
             }
 
-            // Extract job ID from output
             bacalhauJobId = extractJobId(output)
             if (!bacalhauJobId) {
                 log.error "Failed to extract job ID from output: ${output}"
-                throw new IllegalStateException("Failed to extract job ID from Bacalhau output. Output: ${output}")
+                throw new IllegalStateException(
+                    "Failed to extract job ID from Bacalhau output. Output: ${output}")
             }
 
-            log.info "Task ${task.name} submitted successfully to Bacalhau with job ID: ${bacalhauJobId}"
+            log.info "Task ${task.name} submitted — Bacalhau job ID: ${bacalhauJobId}"
 
-            // Set status atomically
             synchronized (this) {
                 jobSubmitted = true
                 status = TaskStatus.SUBMITTED
@@ -135,20 +137,23 @@ class BacalhauTaskHandler extends GridTaskHandler {
             status = TaskStatus.ERROR
             Thread.currentThread().interrupt()
             throw new IllegalStateException("Job submission interrupted for task ${task.name}", e)
+
         } catch (Exception e) {
             log.error "Failed to submit task ${task.name} to Bacalhau", e
             status = TaskStatus.ERROR
             throw e
+
         } finally {
-            // Ensure process is cleaned up
-            if (proc?.isAlive()) {
-                proc.destroyForcibly()
-            }
+            if (proc?.isAlive()) proc.destroyForcibly()
         }
     }
 
     /**
-     * Kill the running job
+     * Kill a running Bacalhau job.
+     *
+     * FIX #6: Added a 30-second timeout to {@code proc.waitFor()} to prevent
+     * the calling thread from blocking indefinitely if the {@code bacalhau job
+     * stop} command hangs.
      */
     @Override
     void kill() {
@@ -156,45 +161,45 @@ class BacalhauTaskHandler extends GridTaskHandler {
             log.warn "Cannot kill task ${task.name}: no job ID available"
             return
         }
-        
+
         log.debug "Killing Bacalhau job: ${bacalhauJobId}"
-        
         try {
-            final cmd = getBacalhauExecutor().getKillCommand() + [bacalhauJobId]
-            final proc = new ProcessBuilder(cmd).start()
-            final exitCode = proc.waitFor()
-            
-            if (exitCode == 0) {
-                log.info "Successfully killed Bacalhau job: ${bacalhauJobId}"
-            } else {
-                log.warn "Failed to kill Bacalhau job ${bacalhauJobId}, exit code: ${exitCode}"
+            final cmd  = getBacalhauExecutor().getKillCommand() + [bacalhauJobId]
+            final proc = new ProcessBuilder(cmd).redirectErrorStream(true).start()
+            // Drain output so the process can exit
+            Thread.start { proc.inputStream.eachLine { } }
+
+            final boolean finished = proc.waitFor(30, TimeUnit.SECONDS)  // FIX #6
+            if (!finished) {
+                proc.destroyForcibly()
+                log.warn "Kill command timed out for job ${bacalhauJobId}"
+                return
             }
-            
+
+            if (proc.exitValue() == 0)
+                log.info "Successfully killed Bacalhau job: ${bacalhauJobId}"
+            else
+                log.warn "Kill command exited non-zero for job ${bacalhauJobId}: ${proc.exitValue()}"
+
         } catch (Exception e) {
             log.warn "Error killing Bacalhau job ${bacalhauJobId}: ${e.message}"
         }
     }
 
     /**
-     * Check if the job is running
+     * Return {@code true} if the job has transitioned to the RUNNING state.
      */
     @Override
     boolean checkIfRunning() {
         synchronized (this) {
-            if (!jobSubmitted || !bacalhauJobId) {
-                return false
-            }
+            if (!jobSubmitted || !bacalhauJobId) return false
         }
 
         try {
             final queueStatus = getBacalhauExecutor().getQueueStatus()
-            final jobStatus = queueStatus.get(bacalhauJobId)
-
-            if (jobStatus == QueueStatus.RUNNING) {
-                synchronized (this) {
-                    status = TaskStatus.RUNNING
-                }
-                log.debug "Task ${task.name} is running (job ID: ${bacalhauJobId})"
+            if (queueStatus.get(bacalhauJobId) == QueueStatus.RUNNING) {
+                synchronized (this) { status = TaskStatus.RUNNING }
+                log.debug "Task ${task.name} is RUNNING (job ID: ${bacalhauJobId})"
                 return true
             }
         } catch (Exception e) {
@@ -205,50 +210,71 @@ class BacalhauTaskHandler extends GridTaskHandler {
     }
 
     /**
-     * Check if the job is completed
+     * Return {@code true} once the job has finished and its results have been
+     * retrieved (or retrieval has been attempted and failed).
+     *
+     * FIX #8: Result retrieval ({@link #retrieveJobResults()}) used to run
+     * synchronously here, blocking the polling-monitor thread for up to 5
+     * minutes per completed job.  It is now started on a dedicated daemon
+     * thread and this method returns {@code false} until the retrieval thread
+     * signals completion via {@code retrievalCompleted}.
      */
     @Override
     boolean checkIfCompleted() {
         synchronized (this) {
-            if (!jobSubmitted || !bacalhauJobId) {
-                return false
-            }
+            if (!jobSubmitted || !bacalhauJobId) return false
         }
 
         try {
             final queueStatus = getBacalhauExecutor().getQueueStatus()
-            final jobStatus = queueStatus.get(bacalhauJobId)
+            final jobStatus   = queueStatus.get(bacalhauJobId)
 
             if (jobStatus == QueueStatus.DONE) {
-                log.info "Task ${task.name} completed, retrieving results (job ID: ${bacalhauJobId})"
-
-                // Retrieve outputs before marking as completed
-                retrieveJobResults()
-
-                // Verify output files exist
-                verifyOutputFiles()
-
-                synchronized (this) {
-                    status = TaskStatus.COMPLETED
-                    task.exitStatus = readExitFile()
-                    task.stdout = task.workDir.resolve(TaskRun.CMD_OUTFILE)
-                    task.stderr = task.workDir.resolve(TaskRun.CMD_ERRFILE)
+                // Start the retrieval thread exactly once (double-checked locking)
+                if (!retrievalStarted) {
+                    synchronized (this) {
+                        if (!retrievalStarted) {
+                            retrievalStarted = true
+                            final String jobId   = bacalhauJobId
+                            Thread.start {
+                                retrieveJobResults(jobId)
+                                retrievalCompleted = true
+                            }
+                        }
+                    }
                 }
+
+                // Poll until the retrieval thread has finished
+                if (!retrievalCompleted) {
+                    log.debug "Task ${task.name}: waiting for result retrieval to complete"
+                    return false
+                }
+
+                // Retrieval finished — advance state
+                verifyOutputFiles()
+                synchronized (this) {
+                    status          = TaskStatus.COMPLETED
+                    task.exitStatus = readExitFile() ?: 0
+                    task.stdout     = task.workDir.resolve(TaskRun.CMD_OUTFILE)
+                    task.stderr     = task.workDir.resolve(TaskRun.CMD_ERRFILE)
+                }
+                log.info "Task ${task.name} completed (job ID: ${bacalhauJobId})"
                 return true
+
             } else if (jobStatus == QueueStatus.ERROR) {
                 log.error "Task ${task.name} failed (job ID: ${bacalhauJobId})"
-
                 synchronized (this) {
-                    status = TaskStatus.ERROR
+                    status          = TaskStatus.ERROR
                     task.exitStatus = readExitFile() ?: 1
-                    task.error = new RuntimeException("Bacalhau job ${bacalhauJobId} failed")
+                    task.error      = new RuntimeException("Bacalhau job ${bacalhauJobId} failed")
                 }
                 return true
             }
+
         } catch (Exception e) {
             log.error "Error checking completion status for task ${task.name}: ${e.message}", e
             synchronized (this) {
-                status = TaskStatus.ERROR
+                status     = TaskStatus.ERROR
                 task.error = new RuntimeException("Failed to check job status: ${e.message}", e)
             }
             return true
@@ -257,20 +283,43 @@ class BacalhauTaskHandler extends GridTaskHandler {
         return false
     }
 
+    // -------------------------------------------------------------------------
+    // Monitoring / trace
+    // -------------------------------------------------------------------------
+
+    @Override
+    TraceRecord getTraceRecord() {
+        final trace = super.getTraceRecord()
+        if (bacalhauJobId)
+            trace.put('native_id', bacalhauJobId)
+        return trace
+    }
+
+    /** Return the Bacalhau job ID (or {@code null} if not yet submitted). */
+    String getJobId() {
+        return bacalhauJobId
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
+
     /**
-     * Retrieve job results from Bacalhau
+     * Download job outputs to the task work directory.
+     *
+     * Called on a background thread (see {@link #checkIfCompleted()}).
+     * Any exception is caught and logged so the retrieval thread always
+     * sets {@code retrievalCompleted = true}.
      */
-    private void retrieveJobResults() {
-        log.debug "Retrieving results for job ${bacalhauJobId}"
+    private void retrieveJobResults(String jobId) {
+        log.debug "Retrieving results for job ${jobId}"
 
         Process proc = null
         try {
-            // Use 'bacalhau job get' to download results to the task work directory
             final cmd = [
                 getBacalhauExecutor().getBacalhauCli(),
-                'job',
-                'get',
-                bacalhauJobId,
+                'job', 'get',
+                jobId,
                 '--output-dir', task.workDir.toString()
             ]
 
@@ -280,121 +329,79 @@ class BacalhauTaskHandler extends GridTaskHandler {
                 .redirectErrorStream(false)
                 .start()
 
-            // Read streams with timeout
             final StringBuilder stdout = new StringBuilder()
             final StringBuilder stderr = new StringBuilder()
 
-            final Thread stdoutThread = Thread.start {
-                proc.inputStream.eachLine { line -> stdout.append(line).append('\n') }
-            }
-            final Thread stderrThread = Thread.start {
-                proc.errorStream.eachLine { line -> stderr.append(line).append('\n') }
-            }
+            final Thread stdoutThread = Thread.start { proc.inputStream.eachLine { stdout.append(it).append('\n') } }
+            final Thread stderrThread = Thread.start { proc.errorStream.eachLine { stderr.append(it).append('\n') } }
 
-            // Wait for process with timeout (5 minutes for large outputs)
-            boolean finished = proc.waitFor(300, TimeUnit.SECONDS)
+            final boolean finished = proc.waitFor(300, TimeUnit.SECONDS)
 
-            stdoutThread.join(5000)
-            stderrThread.join(5000)
+            stdoutThread.join(5_000)
+            stderrThread.join(5_000)
 
             if (!finished) {
                 proc.destroyForcibly()
-                log.warn "Result retrieval timed out for job ${bacalhauJobId}"
+                log.warn "Result retrieval timed out for job ${jobId}"
                 return
             }
 
-            final exitCode = proc.exitValue()
-            final output = stdout.toString()
-            final errorOutput = stderr.toString()
-
+            final int exitCode = proc.exitValue()
             if (exitCode != 0) {
-                log.warn "Failed to retrieve results for job ${bacalhauJobId}. Exit code: ${exitCode}"
-                log.debug "Stdout: ${output}"
-                log.debug "Stderr: ${errorOutput}"
+                log.warn "Result retrieval failed for job ${jobId} (exit ${exitCode}): ${stderr.toString().trim()}"
             } else {
-                log.info "Successfully retrieved results for task ${task.name} (job ID: ${bacalhauJobId})"
+                log.info "Results retrieved for task ${task.name} (job ID: ${jobId})"
             }
+
         } catch (InterruptedException e) {
-            log.warn "Result retrieval interrupted for job ${bacalhauJobId}: ${e.message}"
+            log.warn "Result retrieval interrupted for job ${jobId}"
             Thread.currentThread().interrupt()
         } catch (Exception e) {
-            log.warn "Error retrieving results for job ${bacalhauJobId}: ${e.message}", e
+            log.warn "Error retrieving results for job ${jobId}: ${e.message}", e
         } finally {
-            if (proc?.isAlive()) {
-                proc.destroyForcibly()
-            }
+            if (proc?.isAlive()) proc.destroyForcibly()
         }
     }
 
-    /**
-     * Verify that expected output files exist
-     */
+    /** Warn if expected output files are absent after result retrieval. */
     private void verifyOutputFiles() {
         final exitFile = task.workDir.resolve(TaskRun.CMD_EXIT)
-        final outFile = task.workDir.resolve(TaskRun.CMD_OUTFILE)
-        final errFile = task.workDir.resolve(TaskRun.CMD_ERRFILE)
+        final outFile  = task.workDir.resolve(TaskRun.CMD_OUTFILE)
+        final errFile  = task.workDir.resolve(TaskRun.CMD_ERRFILE)
 
-        if (!exitFile.exists()) {
-            log.warn "Task ${task.name}: Exit file not found at ${exitFile}"
-        }
-        if (!outFile.exists()) {
-            log.debug "Task ${task.name}: Stdout file not found at ${outFile}"
-        }
-        if (!errFile.exists()) {
-            log.debug "Task ${task.name}: Stderr file not found at ${errFile}"
-        }
+        if (!exitFile.exists()) log.warn "Task ${task.name}: exit file not found at ${exitFile}"
+        if (!outFile.exists())  log.debug "Task ${task.name}: stdout file not found at ${outFile}"
+        if (!errFile.exists())  log.debug "Task ${task.name}: stderr file not found at ${errFile}"
     }
 
     /**
-     * Get the job ID for status tracking
-     */
-    String getJobId() {
-        return bacalhauJobId
-    }
-
-    /**
-     * Get trace record for monitoring
-     */
-    @Override
-    TraceRecord getTraceRecord() {
-        final trace = super.getTraceRecord()
-        if (bacalhauJobId) {
-            trace.put('native_id', bacalhauJobId)
-        }
-        return trace
-    }
-
-    /**
-     * Extract job ID from Bacalhau command output
-     * Bacalhau job IDs are typically in UUID format: j-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+     * Extract a Bacalhau job ID (UUID or j-UUID format) from CLI output.
+     *
+     * Tries a strict whole-line match first, then falls back to finding a
+     * UUID anywhere in the output.
      */
     private String extractJobId(String output) {
-        if (!output?.trim()) {
-            return null
-        }
+        if (!output?.trim()) return null
 
-        // Bacalhau typically returns just the job ID on successful submission
-        // Job ID format: j-<uuid> or just <uuid>
-        // UUID pattern: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        final uuidPattern = /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/
+        final uuidPattern  = /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/
         final jobIdPattern = /(?:j-)?${uuidPattern}/
 
-        final lines = output.trim().split('\n')
+        final String[] lines = output.trim().split('\n')
 
-        // Try to find a line matching the strict job ID pattern
+        // Strict: full-line match
         for (String line : lines) {
-            final trimmed = line.trim()
+            final String trimmed = line.trim()
             if (trimmed.matches(jobIdPattern)) {
                 log.debug "Extracted job ID: ${trimmed}"
                 return trimmed
             }
         }
 
-        // If no strict match, try to extract UUID from the output
+        // Fallback: UUID embedded in a longer line
         for (String line : lines) {
             final matcher = line =~ uuidPattern
             if (matcher.find()) {
-                final jobId = matcher.group(0)
+                final String jobId = matcher.group(0)
                 log.debug "Extracted job ID from line: ${jobId}"
                 return jobId
             }
@@ -404,15 +411,12 @@ class BacalhauTaskHandler extends GridTaskHandler {
         return null
     }
 
-    /**
-     * Read the exit status file
-     */
+    /** Read the integer exit status written by the task script. */
     private Integer readExitFile() {
         try {
             final exitFile = task.workDir.resolve(TaskRun.CMD_EXIT)
-            if (exitFile.exists()) {
+            if (exitFile.exists())
                 return exitFile.text.trim().toInteger()
-            }
         } catch (Exception e) {
             log.debug "Failed to read exit file for task ${task.name}: ${e.message}"
         }
