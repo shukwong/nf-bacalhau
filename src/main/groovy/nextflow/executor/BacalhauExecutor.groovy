@@ -24,6 +24,7 @@ import org.pf4j.ExtensionPoint
 
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Nextflow executor for Bacalhau distributed compute platform.
@@ -47,6 +48,9 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     /** Default job submission timeout in seconds */
     static final int DEFAULT_SUBMIT_TIMEOUT = 300
 
+    /** How long (ms) a cached queue-status result remains valid within one poll cycle. */
+    private static final long QUEUE_STATUS_CACHE_TTL_MS = 5_000L
+
     // -------------------------------------------------------------------------
     // Configuration (loaded once in initialize())
     // -------------------------------------------------------------------------
@@ -55,6 +59,13 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     private Boolean waitForCompletion
     private Integer maxRetries
     private String storageEngine
+    private String s3Region
+
+    // -------------------------------------------------------------------------
+    // Queue-status cache (FIX #3)
+    // -------------------------------------------------------------------------
+    private volatile Map<String, QueueStatus> cachedQueueStatus = [:]
+    private final AtomicLong cacheTimestamp = new AtomicLong(0L)
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -106,7 +117,9 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         if (!['ipfs', 's3', 'local'].contains(storageEngine))
             log.warn "Unknown storage engine: ${storageEngine}"
 
-        log.debug "Config loaded — CLI: ${bacalhauCliPath}, node: ${bacalhauNode}, maxRetries: ${maxRetries}"
+        s3Region = config.s3Region?.toString() ?: 'us-east-1'
+
+        log.debug "Config loaded — CLI: ${bacalhauCliPath}, node: ${bacalhauNode}, maxRetries: ${maxRetries}, s3Region: ${s3Region}"
     }
 
     /** Return the configured path to the Bacalhau binary. */
@@ -170,7 +183,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         final String scriptDir  = scriptFile.getParent().toAbsolutePath().toString()
 
         final StringBuilder sb = new StringBuilder()
-        sb.append("Name: \"${task.name}\"\n")
+        sb.append("Name: ${yamlQuote(task.name)}\n")
         sb.append("Namespace: default\n")
         sb.append("Type: batch\n")
         sb.append("Count: 1\n")
@@ -179,10 +192,10 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         sb.append("    Engine:\n")
         sb.append("      Type: docker\n")
         sb.append("      Params:\n")
-        sb.append("        Image: \"${container}\"\n")
+        sb.append("        Image: ${yamlQuote(container)}\n")
         sb.append("        Entrypoint:\n")
         sb.append("          - bash\n")
-        sb.append("          - \"/tmp/${scriptName}\"\n")
+        sb.append("          - ${yamlQuote("/tmp/${scriptName}")}\n")
 
         // --- Input sources ---
         sb.append("    InputSources:\n")
@@ -191,7 +204,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         sb.append("      - Source:\n")
         sb.append("          Type: localDirectory\n")
         sb.append("          Params:\n")
-        sb.append("            SourcePath: \"${scriptDir}\"\n")
+        sb.append("            SourcePath: ${yamlQuote(scriptDir)}\n")
         sb.append("            ReadWrite: false\n")
         sb.append("        Target: /tmp\n")
 
@@ -207,25 +220,25 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
                     sb.append("      - Source:\n")
                     sb.append("          Type: s3\n")
                     sb.append("          Params:\n")
-                    sb.append("            Bucket: \"${bucket}\"\n")
-                    sb.append("            Key: \"${key}\"\n")
-                    sb.append("            Region: us-east-1\n")
-                    sb.append("        Target: \"/inputs/${name}\"\n")
+                    sb.append("            Bucket: ${yamlQuote(bucket)}\n")
+                    sb.append("            Key: ${yamlQuote(key)}\n")
+                    sb.append("            Region: ${yamlQuote(s3Region)}\n")
+                    sb.append("        Target: ${yamlQuote("/inputs/${name}")}\n")
                 } else if (pathStr.startsWith('host://')) {
-                    final String hostPath = pathStr.substring(7)  // strip 'host://'
+                    final String hostPath = validateHostPath(pathStr.substring(7))
                     sb.append("      - Source:\n")
                     sb.append("          Type: localDirectory\n")
                     sb.append("          Params:\n")
-                    sb.append("            SourcePath: \"${hostPath}\"\n")
+                    sb.append("            SourcePath: ${yamlQuote(hostPath)}\n")
                     sb.append("            ReadWrite: false\n")
-                    sb.append("        Target: \"/inputs/${name}\"\n")
+                    sb.append("        Target: ${yamlQuote("/inputs/${name}")}\n")
                 } else {
                     sb.append("      - Source:\n")
                     sb.append("          Type: localDirectory\n")
                     sb.append("          Params:\n")
-                    sb.append("            SourcePath: \"${path.toAbsolutePath()}\"\n")
+                    sb.append("            SourcePath: ${yamlQuote(path.toAbsolutePath().toString())}\n")
                     sb.append("            ReadWrite: false\n")
-                    sb.append("        Target: \"/inputs/${name}\"\n")
+                    sb.append("        Target: ${yamlQuote("/inputs/${name}")}\n")
                 }
             }
         }
@@ -245,11 +258,11 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
             if (hasCpu)
                 sb.append("      CPU: \"${cpus}\"\n")
             if (memory)
-                sb.append("      Memory: \"${formatMemory(memory)}\"\n")
+                sb.append("      Memory: ${yamlQuote(formatMemory(memory))}\n")
             if (hasGpu)
                 sb.append("      GPU: \"${accelerator.request}\"\n")
             if (disk)
-                sb.append("      Disk: \"${formatMemory(disk)}\"\n")
+                sb.append("      Disk: ${yamlQuote(formatMemory(disk))}\n")
         }
 
         // --- Execution timeout ---
@@ -259,39 +272,53 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
             sb.append("      ExecutionTimeout: ${formatTimeout(time)}\n")
         }
 
-        // --- Environment variables ---
-        final Map<String, String> env = task.config.getEnvironment()
-        boolean envHeaderWritten = false
-        if (env) {
+        // --- Environment variables and secrets (unified block) ---
+        final Map<String, String> envEntries = collectEnvEntries(task)
+        if (envEntries) {
             sb.append("    Env:\n")
-            envHeaderWritten = true
+            envEntries.each { String key, String value ->
+                sb.append("      ${key}: ${yamlQuote(value)}\n")
+            }
+        }
+
+        return sb.toString()
+    }
+
+    /**
+     * Collect all environment variable entries (regular + secrets) for a task.
+     * Validates variable names and merges both sources into a single map.
+     */
+    private Map<String, String> collectEnvEntries(TaskRun task) {
+        final Map<String, String> entries = new LinkedHashMap<>()
+
+        // Regular environment variables
+        final Map<String, String> env = task.config.getEnvironment()
+        if (env) {
             env.each { String key, String value ->
                 if (key?.matches(/^[A-Za-z_][A-Za-z0-9_]*$/)) {
-                    sb.append("      ${key}: \"${value}\"\n")
+                    entries[key] = value
                 } else {
                     log.warn "Task ${task.name}: skipping invalid env var name: ${key}"
                 }
             }
         }
 
-        // --- Secrets via env injection ---
+        // Secrets via env injection
         final Map extConfig = task.config.getExt() as Map
         if (extConfig && extConfig.containsKey('bacalhauSecrets')) {
             final secrets = extConfig.get('bacalhauSecrets')
             final List secretList = secrets instanceof List ? secrets as List : [secrets]
-            if (!envHeaderWritten)
-                sb.append("    Env:\n")
             secretList.each { secretName ->
                 final String sn = secretName?.toString()
                 if (sn?.matches(/^[A-Za-z_][A-Za-z0-9_]*$/)) {
-                    sb.append("      ${sn}: \"\${${sn}}\"\n")
+                    entries[sn] = "\${${sn}}"
                 } else {
                     log.warn "Task ${task.name}: skipping invalid secret name: ${secretName}"
                 }
             }
         }
 
-        return sb.toString()
+        return entries
     }
 
     /**
@@ -304,10 +331,12 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     protected String formatMemory(Object memory) {
         if (memory instanceof MemoryUnit) {
             final long bytes = (memory as MemoryUnit).toBytes()
-            if (bytes >= 1_073_741_824L)
+            if (bytes >= 1_073_741_824L && bytes % 1_073_741_824L == 0)
                 return "${bytes.intdiv(1_073_741_824L)}gb"
-            if (bytes >= 1_048_576L)
+            if (bytes >= 1_048_576L && bytes % 1_048_576L == 0)
                 return "${bytes.intdiv(1_048_576L)}mb"
+            if (bytes >= 1_024L && bytes % 1_024L == 0)
+                return "${bytes.intdiv(1_024L)}kb"
             return "${bytes}b"
         }
         // Fallback for unexpected types: strip spaces and lowercase
@@ -349,6 +378,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         return ''
     }
 
+    /** Intentionally a no-op: Bacalhau does not use batch-script header directives. */
     @Override
     List getDirectives(TaskRun task, List result) {
         return result
@@ -404,18 +434,23 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     }
 
     /**
-     * Fetch the current job list from the Bacalhau API.
+     * Fetch the current job list from the Bacalhau API, with per-poll-cycle
+     * caching so that multiple task handlers share a single CLI call.
      *
-     * FIX #5: The original implementation read only stdout and left stderr
-     * unconsumed.  If the process writes enough to stderr to fill the OS pipe
-     * buffer the process blocks, creating a deadlock.  We now drain both
-     * streams in background threads and add a 60-second hard timeout.
+     * FIX #3: Without caching, N tasks trigger up to 2N CLI processes per poll.
+     * FIX #5: Drains both stdout/stderr to prevent pipe-buffer deadlock.
      */
     protected Map<String, QueueStatus> getQueueStatus() {
+        final long now = System.currentTimeMillis()
+        if (now - cacheTimestamp.get() < QUEUE_STATUS_CACHE_TTL_MS) {
+            return cachedQueueStatus
+        }
+
         log.debug "Fetching queue status from Bacalhau"
+        Process proc = null
         try {
             final List<String> cmd = [getBacalhauCli(), 'job', 'list', '--output', 'json']
-            final Process proc = new ProcessBuilder(cmd).redirectErrorStream(false).start()
+            proc = new ProcessBuilder(cmd).redirectErrorStream(false).start()
 
             final StringBuilder stdout = new StringBuilder()
             final StringBuilder stderr = new StringBuilder()
@@ -440,10 +475,15 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
                 return [:]
             }
 
-            return parseQueueStatus(stdout.toString())
+            final Map<String, QueueStatus> result = parseQueueStatus(stdout.toString())
+            cachedQueueStatus = result
+            cacheTimestamp.set(System.currentTimeMillis())
+            return result
         } catch (Exception e) {
             log.warn "Failed to get queue status: ${e.message}"
             return [:]
+        } finally {
+            if (proc?.isAlive()) proc.destroyForcibly()
         }
     }
 
@@ -469,8 +509,9 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
      * block indefinitely.  We now enforce a 30-second timeout.
      */
     private boolean isBacalhauAvailable() {
+        Process proc = null
         try {
-            final Process proc = new ProcessBuilder([getBacalhauCli(), 'version'])
+            proc = new ProcessBuilder([getBacalhauCli(), 'version'])
                 .redirectErrorStream(true)
                 .start()
             // Drain output so the process can exit cleanly
@@ -488,6 +529,8 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         } catch (Exception e) {
             log.debug "Bacalhau CLI check failed: ${e.message}"
             return false
+        } finally {
+            if (proc?.isAlive()) proc.destroyForcibly()
         }
     }
 
@@ -519,5 +562,40 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
                 log.warn "Unknown Bacalhau job status: ${status}"
                 return QueueStatus.UNKNOWN
         }
+    }
+
+    /**
+     * Escape a string for safe inclusion in a YAML double-quoted scalar.
+     *
+     * FIX #1/#2: Prevents YAML injection by escaping backslashes, double
+     * quotes, newlines, carriage returns, and tabs before wrapping in quotes.
+     */
+    protected static String yamlQuote(String value) {
+        if (value == null) return '""'
+        final String escaped = value
+            .replace('\\', '\\\\')
+            .replace('"',  '\\"')
+            .replace('\n', '\\n')
+            .replace('\r', '\\r')
+            .replace('\t', '\\t')
+        return "\"${escaped}\""
+    }
+
+    /**
+     * Validate and normalize a {@code host://} path to prevent path traversal.
+     *
+     * FIX #8: Rejects paths containing {@code ..} components that could escape
+     * the intended mount scope.
+     *
+     * @throws IllegalArgumentException if the path contains traversal sequences
+     */
+    protected static String validateHostPath(String hostPath) {
+        if (!hostPath || hostPath.trim().isEmpty())
+            throw new IllegalArgumentException("host:// path must not be empty")
+        final String normalized = new File(hostPath).canonicalPath
+        if (hostPath.contains('..'))
+            throw new IllegalArgumentException(
+                "host:// path must not contain '..' traversal: ${hostPath}")
+        return normalized
     }
 }

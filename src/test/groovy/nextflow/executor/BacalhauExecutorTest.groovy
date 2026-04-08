@@ -40,6 +40,8 @@ class BacalhauExecutorTest extends Specification {
         executor.session = Mock(Session) {
             getRunName() >> 'test-run'
         }
+        // Set default config values normally loaded by initialize()/loadConfiguration()
+        executor.@s3Region = 'us-east-1'
     }
 
     // -------------------------------------------------------------------------
@@ -420,5 +422,54 @@ class BacalhauExecutorTest extends Specification {
         executor.formatMemory(new MemoryUnit(4_294_967_296L)) == '4gb'    // 4 GiB
         executor.formatMemory(new MemoryUnit(536_870_912L))   == '512mb'  // 512 MiB
         executor.formatMemory(new MemoryUnit(1_073_741_824L)) == '1gb'    // 1 GiB
+    }
+
+    def 'formatMemory should not lose precision for non-power-of-2 GB values'() {
+        expect:
+        // 1.5 GiB = 1,610,612,736 bytes — should become 1536mb, not 1gb
+        executor.formatMemory(new MemoryUnit(1_610_612_736L)) == '1536mb'
+        // 2.5 GiB
+        executor.formatMemory(new MemoryUnit(2_684_354_560L)) == '2560mb'
+    }
+
+    // -------------------------------------------------------------------------
+    // YAML escaping (FIX #1, #2)
+    // -------------------------------------------------------------------------
+
+    def 'yamlQuote should escape special characters'() {
+        expect:
+        BacalhauExecutor.yamlQuote('simple')         == '"simple"'
+        BacalhauExecutor.yamlQuote('has "quotes"')   == '"has \\"quotes\\""'
+        BacalhauExecutor.yamlQuote('line1\nline2')   == '"line1\\nline2"'
+        BacalhauExecutor.yamlQuote('back\\slash')    == '"back\\\\slash"'
+        BacalhauExecutor.yamlQuote(null)             == '""'
+    }
+
+    // -------------------------------------------------------------------------
+    // host:// path validation (FIX #8)
+    // -------------------------------------------------------------------------
+
+    def 'validateHostPath should reject path traversal'() {
+        when:
+        BacalhauExecutor.validateHostPath('/../../../etc/passwd')
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    def 'validateHostPath should accept valid absolute path'() {
+        when:
+        def result = BacalhauExecutor.validateHostPath('/data/myfiles')
+
+        then:
+        result == '/data/myfiles'
+    }
+
+    def 'validateHostPath should reject empty path'() {
+        when:
+        BacalhauExecutor.validateHostPath('')
+
+        then:
+        thrown(IllegalArgumentException)
     }
 }

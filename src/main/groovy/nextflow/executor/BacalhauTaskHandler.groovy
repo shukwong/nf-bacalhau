@@ -20,6 +20,7 @@ import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
 import nextflow.trace.TraceRecord
 
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
@@ -42,12 +43,12 @@ class BacalhauTaskHandler extends GridTaskHandler {
      * thread so that {@link #checkIfCompleted()} does not block the Nextflow
      * task-polling monitor for up to 5 minutes per job.
      *
-     * The flag is set by the retrieval thread when it finishes (success or
-     * failure), after which {@code checkIfCompleted()} may advance the task
-     * state and return {@code true}.
+     * FIX #4: Uses a {@link CountDownLatch} instead of volatile booleans to
+     * guarantee happens-before between the retrieval thread's side effects
+     * (files written to disk) and the polling thread reading them.
      */
-    private volatile boolean retrievalStarted   = false
-    private volatile boolean retrievalCompleted = false
+    private volatile boolean retrievalStarted = false
+    private final CountDownLatch retrievalLatch = new CountDownLatch(1)
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -230,27 +231,29 @@ class BacalhauTaskHandler extends GridTaskHandler {
             final jobStatus   = queueStatus.get(bacalhauJobId)
 
             if (jobStatus == QueueStatus.DONE) {
-                // Start the retrieval thread exactly once (double-checked locking)
-                if (!retrievalStarted) {
-                    synchronized (this) {
-                        if (!retrievalStarted) {
-                            retrievalStarted = true
-                            final String jobId   = bacalhauJobId
-                            Thread.start {
+                // Start the retrieval thread exactly once
+                synchronized (this) {
+                    if (!retrievalStarted) {
+                        retrievalStarted = true
+                        final String jobId = bacalhauJobId
+                        Thread.start {
+                            try {
                                 retrieveJobResults(jobId)
-                                retrievalCompleted = true
+                            } finally {
+                                retrievalLatch.countDown()
                             }
                         }
                     }
                 }
 
-                // Poll until the retrieval thread has finished
-                if (!retrievalCompleted) {
+                // Non-blocking check: has the retrieval thread finished?
+                if (retrievalLatch.getCount() > 0) {
                     log.debug "Task ${task.name}: waiting for result retrieval to complete"
                     return false
                 }
 
-                // Retrieval finished — advance state
+                // Latch is at zero — retrieval thread has finished and all its
+                // memory effects are visible (CountDownLatch guarantees happens-before).
                 verifyOutputFiles()
                 synchronized (this) {
                     status          = TaskStatus.COMPLETED
