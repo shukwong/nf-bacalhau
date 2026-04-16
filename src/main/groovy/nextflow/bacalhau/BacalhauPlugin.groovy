@@ -15,18 +15,24 @@
 package nextflow.bacalhau
 
 import groovy.transform.CompileStatic
-import groovy.util.logging.Slf4j
 import org.pf4j.Plugin
 import org.pf4j.PluginWrapper
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
 
 /**
- * Nextflow plugin for Bacalhau distributed compute integration
+ * Nextflow plugin for Bacalhau distributed compute integration.
+ *
+ * Uses an explicit SLF4J logger instead of {@code @Slf4j}, because the
+ * parent {@link Plugin} class already declares a {@code log} field and
+ * {@code @Slf4j} would collide.
  *
  * @author Nextflow Contributors
  */
-@Slf4j
 @CompileStatic
 class BacalhauPlugin extends Plugin {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(BacalhauPlugin)
 
     BacalhauPlugin(PluginWrapper wrapper) {
         super(wrapper)
@@ -34,11 +40,11 @@ class BacalhauPlugin extends Plugin {
 
     @Override
     void start() {
-        log.info("Bacalhau plugin started")
+        LOGGER.info("Bacalhau plugin started")
     }
 
     @Override
     void stop() {
-        log.info("Bacalhau plugin stopped")
+        LOGGER.info("Bacalhau plugin stopped")
     }
 }

@@ -15,6 +15,8 @@
 package nextflow.executor
 
 import nextflow.Session
+import nextflow.executor.AbstractGridExecutor.QueueStatus
+import nextflow.executor.res.AcceleratorResource
 import nextflow.processor.TaskConfig
 import nextflow.processor.TaskRun
 import nextflow.util.MemoryUnit
@@ -73,9 +75,9 @@ class BacalhauExecutorTest extends Specification {
                 getTime()        >> null
                 getDisk()        >> null
                 getAccelerator() >> null
-                getEnvironment() >> null
-                getExt()         >> null
+                get('ext')       >> null
             }
+            getEnvironment() >> null
             getInputFilesMap() >> [
                 'file1.txt': tempDir.resolve('file1.txt'),
                 'file2.csv': tempDir.resolve('file2.csv')
@@ -110,9 +112,9 @@ class BacalhauExecutorTest extends Specification {
                 getTime()        >> null
                 getDisk()        >> null
                 getAccelerator() >> null
-                getEnvironment() >> null
-                getExt()         >> null
+                get('ext')       >> null
             }
+            getEnvironment() >> null
             getInputFilesMap() >> [:]
         }
         def scriptFile = tempDir.resolve('run.sh')
@@ -128,10 +130,7 @@ class BacalhauExecutorTest extends Specification {
     def 'should embed memory resource in the YAML spec in Bacalhau format'() {
         // FIX #7: memory must be "4gb" not "4 GB"
         given:
-        def memory = Mock(MemoryUnit) {
-            // 4 GB in bytes
-            toBytes() >> 4_294_967_296L
-        }
+        def memory = new MemoryUnit(4_294_967_296L)   // 4 GiB
         def task = Mock(TaskRun) {
             getName() >> 'test-task'
             getContainer() >> 'alpine:latest'
@@ -142,9 +141,9 @@ class BacalhauExecutorTest extends Specification {
                 getTime()        >> null
                 getDisk()        >> null
                 getAccelerator() >> null
-                getEnvironment() >> null
-                getExt()         >> null
+                get('ext')       >> null
             }
+            getEnvironment() >> null
             getInputFilesMap() >> [:]
         }
         def scriptFile = tempDir.resolve('run.sh')
@@ -172,9 +171,9 @@ class BacalhauExecutorTest extends Specification {
                 getTime()        >> null
                 getDisk()        >> null
                 getAccelerator() >> null
-                getEnvironment() >> null
-                getExt()         >> null
+                get('ext')       >> null
             }
+            getEnvironment() >> null
             getInputFilesMap() >> [
                 'file1.txt': Path.of('/data/file1.txt'),
                 'file2.csv': Path.of('/data/file2.csv')
@@ -198,7 +197,10 @@ class BacalhauExecutorTest extends Specification {
     }
 
     def 'should embed S3 inputs as s3 InputSources in YAML'() {
-        given:
+        given: 'a Path whose toString() is an s3:// URI (as produced by Nextflow S3 plugin)'
+        def s3Path = Mock(Path) {
+            toString() >> 's3://my-bucket/path/to/data.csv'
+        }
         def task = Mock(TaskRun) {
             getName() >> 'test-task'
             getContainer() >> 'ubuntu:latest'
@@ -209,12 +211,10 @@ class BacalhauExecutorTest extends Specification {
                 getTime()        >> null
                 getDisk()        >> null
                 getAccelerator() >> null
-                getEnvironment() >> null
-                getExt()         >> null
+                get('ext')       >> null
             }
-            getInputFilesMap() >> [
-                'data.csv': Path.of('s3://my-bucket/path/to/data.csv')
-            ]
+            getEnvironment() >> null
+            getInputFilesMap() >> ['data.csv': s3Path]
         }
         def scriptFile = tempDir.resolve('script.sh')
 
@@ -312,7 +312,9 @@ class BacalhauExecutorTest extends Specification {
 
     def 'should create task handler'() {
         given:
-        def task = Mock(TaskRun)
+        def task = Mock(TaskRun) {
+            getWorkDir() >> tempDir
+        }
 
         when:
         def handler = executor.createTaskHandler(task)
@@ -352,9 +354,9 @@ class BacalhauExecutorTest extends Specification {
 
     def 'should embed GPU and environment variables in YAML spec'() {
         given:
-        def accelerator = Mock(nextflow.util.AcceleratorResource) {
-            getRequest() >> 1
-        }
+        // AcceleratorResource.getRequest() is final, so it can't be mocked —
+        // use a real instance.
+        def accelerator = new AcceleratorResource(1)
         def task = Mock(TaskRun) {
             getName() >> 'gpu-task'
             getContainer() >> 'nvidia/cuda:latest'
@@ -365,9 +367,9 @@ class BacalhauExecutorTest extends Specification {
                 getTime()        >> null
                 getDisk()        >> null
                 getAccelerator() >> accelerator
-                getEnvironment() >> ['MY_ENV': 'my_val']
-                getExt()         >> null
+                get('ext')       >> null
             }
+            getEnvironment() >> ['MY_ENV': 'my_val']
             getInputFilesMap() >> [:]
         }
         def scriptFile = tempDir.resolve('script.sh')
@@ -397,9 +399,9 @@ class BacalhauExecutorTest extends Specification {
                 getTime()        >> null
                 getDisk()        >> null
                 getAccelerator() >> null
-                getEnvironment() >> null
-                getExt()         >> ['bacalhauSecrets': ['API_KEY', 'DB_PASS']]
+                get('ext')       >> ['bacalhauSecrets': ['API_KEY', 'DB_PASS']]
             }
+            getEnvironment() >> null
             getInputFilesMap() >> [:]
         }
         def scriptFile = tempDir.resolve('script.sh')
