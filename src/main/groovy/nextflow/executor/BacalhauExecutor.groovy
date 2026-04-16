@@ -16,6 +16,7 @@ package nextflow.executor
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
+import nextflow.processor.TaskMonitor
 import nextflow.processor.TaskRun
 import nextflow.util.Duration
 import nextflow.util.MemoryUnit
@@ -24,7 +25,6 @@ import org.pf4j.ExtensionPoint
 
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Nextflow executor for Bacalhau distributed compute platform.
@@ -48,8 +48,15 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     /** Default job submission timeout in seconds */
     static final int DEFAULT_SUBMIT_TIMEOUT = 300
 
+    /** Container path where the Nextflow task script is mounted.
+     *  Uses a dedicated directory so we don't overlay the container's /tmp. */
+    static final String NEXTFLOW_SCRIPT_MOUNT = '/nextflow-scripts'
+
     /** How long (ms) a cached queue-status result remains valid within one poll cycle. */
     private static final long QUEUE_STATUS_CACHE_TTL_MS = 5_000L
+
+    /** How long to suppress retries after a queue-status CLI failure. */
+    private static final long QUEUE_STATUS_FAILURE_BACKOFF_MS = 10_000L
 
     // -------------------------------------------------------------------------
     // Configuration (loaded once in initialize())
@@ -61,11 +68,14 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     private String storageEngine
     private String s3Region
 
-    // -------------------------------------------------------------------------
-    // Queue-status cache (FIX #3)
-    // -------------------------------------------------------------------------
-    private volatile Map<String, QueueStatus> cachedQueueStatus = [:]
-    private final AtomicLong cacheTimestamp = new AtomicLong(0L)
+    // Queue-status cache. Reads and writes of the cache fields go through
+    // `queueStatusLock`; the CLI fetch itself happens outside the lock so it
+    // doesn't serialize every polling thread. `fetchInProgress` ensures only
+    // one thread fetches at a time — the rest return the last known snapshot.
+    private final Object queueStatusLock = new Object()
+    private Map<String, QueueStatus> cachedQueueStatus = [:]
+    private long cacheTimestamp = 0L
+    private boolean fetchInProgress = false
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -84,25 +94,15 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     }
 
     /**
-     * Load configuration.
-     *
-     * Priority (highest first):
-     *   1. Dedicated {@code bacalhau { }} config block
-     *   2. {@code process { ext { } }} block (legacy / backward compat)
-     *
-     * FIX #12: executor-level settings were previously read only from
-     * process.ext, which is per-task and not the right place for executor
-     * globals.  We now read from a top-level {@code bacalhau { }} block and
-     * fall back to process.ext for backward compatibility.
+     * Load configuration. A dedicated {@code bacalhau { }} block wins over
+     * {@code process.ext} so that executor-wide settings live at executor
+     * scope, not per-task.
      */
     private void loadConfiguration() {
-        // 1. Dedicated bacalhau {} config block (preferred)
         final Map bacalhauConfig = (session?.config?.bacalhau as Map) ?: [:]
-        // 2. Legacy process.ext (fallback)
         final Map processConfig  = (session?.config?.process  as Map) ?: [:]
         final Map extConfig      = (processConfig?.ext        as Map) ?: [:]
 
-        // Merge — bacalhauConfig wins on conflicts
         final Map config = (extConfig + bacalhauConfig) as Map
 
         bacalhauCliPath   = config.bacalhauCliPath?.toString() ?: BACALHAU_CLI
@@ -128,20 +128,12 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     }
 
     // -------------------------------------------------------------------------
-    // Job submission — FIX #4 + #9
+    // Job submission
     // -------------------------------------------------------------------------
 
     /**
-     * Build the CLI command to submit a task.
-     *
-     * FIX #4: The old {@code bacalhau docker run} sub-command was removed in
-     * Bacalhau v1.x.  We now write a YAML job specification to the task work
-     * directory and submit it with {@code bacalhau job run}.
-     *
-     * FIX #9: The original code used two different {@code -i} flag syntaxes
-     * ({@code path:dest} and {@code src=…,dst=…}) in the same command.  Both
-     * issues are eliminated by moving all input declarations into the typed
-     * YAML {@code InputSources} block.
+     * Build the CLI command to submit a task. Writes a YAML job spec to the
+     * task work directory and invokes {@code bacalhau job run <spec>}.
      */
     @Override
     List<String> getSubmitCommandLine(TaskRun task, Path scriptFile) {
@@ -170,14 +162,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         return cmd
     }
 
-    /**
-     * Build a Bacalhau v1.x YAML job specification from the Nextflow task.
-     *
-     * FIX #7: Resource values (CPU, memory, time) are now formatted in the
-     * compact notation that the Bacalhau API expects (e.g. {@code "4gb"},
-     * {@code 3600}) rather than relying on Nextflow's own {@code toString()}
-     * which can produce strings like {@code "4 GB"} or {@code "PT1H"}.
-     */
+    /** Build a Bacalhau v1.x YAML job specification from the Nextflow task. */
     protected String buildJobSpec(TaskRun task, Path scriptFile, String container) {
         final String scriptName = scriptFile.getFileName().toString()
         final String scriptDir  = scriptFile.getParent().toAbsolutePath().toString()
@@ -195,18 +180,19 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         sb.append("        Image: ${yamlQuote(container)}\n")
         sb.append("        Entrypoint:\n")
         sb.append("          - bash\n")
-        sb.append("          - ${yamlQuote("/tmp/${scriptName}")}\n")
+        sb.append("          - ${yamlQuote("${NEXTFLOW_SCRIPT_MOUNT}/${scriptName}")}\n")
 
         // --- Input sources ---
         sb.append("    InputSources:\n")
 
-        // Script file: mount its parent directory so the script lands in /tmp
+        // Script file: mount its parent directory at a dedicated path so we
+        // don't overlay the container's /tmp (which many images rely on).
         sb.append("      - Source:\n")
         sb.append("          Type: localDirectory\n")
         sb.append("          Params:\n")
         sb.append("            SourcePath: ${yamlQuote(scriptDir)}\n")
         sb.append("            ReadWrite: false\n")
-        sb.append("        Target: /tmp\n")
+        sb.append("        Target: ${NEXTFLOW_SCRIPT_MOUNT}\n")
 
         // Task input files
         final Map<String, Path> inputFiles = task.getInputFilesMap()
@@ -249,8 +235,9 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         final accelerator = task.config.getAccelerator()
         final disk        = task.config.getDisk()
 
+        final Integer gpuRequest = accelerator?.request
         final boolean hasCpu  = cpus && (cpus as int) > 0
-        final boolean hasGpu  = accelerator && accelerator.request > 0
+        final boolean hasGpu  = gpuRequest != null && gpuRequest > 0
         final boolean hasRes  = hasCpu || memory || hasGpu || disk
 
         if (hasRes) {
@@ -260,16 +247,16 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
             if (memory)
                 sb.append("      Memory: ${yamlQuote(formatMemory(memory))}\n")
             if (hasGpu)
-                sb.append("      GPU: \"${accelerator.request}\"\n")
+                sb.append("      GPU: \"${gpuRequest}\"\n")
             if (disk)
                 sb.append("      Disk: ${yamlQuote(formatMemory(disk))}\n")
         }
 
         // --- Execution timeout ---
-        final time = task.config.getTime()
-        if (time) {
+        final long timeoutSecs = formatTimeout(task.config.getTime())
+        if (timeoutSecs > 0) {
             sb.append("    Timeouts:\n")
-            sb.append("      ExecutionTimeout: ${formatTimeout(time)}\n")
+            sb.append("      ExecutionTimeout: ${timeoutSecs}\n")
         }
 
         // --- Environment variables and secrets (unified block) ---
@@ -284,34 +271,36 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         return sb.toString()
     }
 
+    /** Matches a valid shell/env identifier. */
+    private static final java.util.regex.Pattern ENV_NAME_PATTERN =
+        java.util.regex.Pattern.compile('^[A-Za-z_][A-Za-z0-9_]*$')
+
     /**
-     * Collect all environment variable entries (regular + secrets) for a task.
-     * Validates variable names and merges both sources into a single map.
+     * Collect validated environment variable entries for a task, including
+     * any secret names declared under {@code ext.bacalhauSecrets}.
      */
     private Map<String, String> collectEnvEntries(TaskRun task) {
         final Map<String, String> entries = new LinkedHashMap<>()
 
-        // Regular environment variables
-        final Map<String, String> env = task.config.getEnvironment()
+        final Map<String, String> env = task.getEnvironment()
         if (env) {
             env.each { String key, String value ->
-                if (key?.matches(/^[A-Za-z_][A-Za-z0-9_]*$/)) {
-                    entries[key] = value
+                if (key != null && ENV_NAME_PATTERN.matcher(key).matches()) {
+                    entries.put(key, value)
                 } else {
                     log.warn "Task ${task.name}: skipping invalid env var name: ${key}"
                 }
             }
         }
 
-        // Secrets via env injection
-        final Map extConfig = task.config.getExt() as Map
-        if (extConfig && extConfig.containsKey('bacalhauSecrets')) {
-            final secrets = extConfig.get('bacalhauSecrets')
+        final Object extRaw = task.config.get('ext')
+        if (extRaw instanceof Map && ((Map) extRaw).containsKey('bacalhauSecrets')) {
+            final Object secrets = ((Map) extRaw).get('bacalhauSecrets')
             final List secretList = secrets instanceof List ? secrets as List : [secrets]
             secretList.each { secretName ->
                 final String sn = secretName?.toString()
-                if (sn?.matches(/^[A-Za-z_][A-Za-z0-9_]*$/)) {
-                    entries[sn] = "\${${sn}}"
+                if (sn != null && ENV_NAME_PATTERN.matcher(sn).matches()) {
+                    entries.put(sn, '${' + sn + '}')
                 } else {
                     log.warn "Task ${task.name}: skipping invalid secret name: ${secretName}"
                 }
@@ -322,11 +311,10 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     }
 
     /**
-     * Format a Nextflow {@link MemoryUnit} (or any object) into the compact
-     * memory string expected by Bacalhau (e.g. {@code "512mb"}, {@code "4gb"}).
-     *
-     * FIX #7: Nextflow's MemoryUnit.toString() returns strings like "4 GB"
-     * (with a space), which the Bacalhau CLI rejects.
+     * Format a {@link MemoryUnit} (or any value) into the compact memory
+     * string Bacalhau expects (e.g. {@code "512mb"}, {@code "4gb"}).
+     * Nextflow's own {@code toString()} returns {@code "4 GB"} with a space,
+     * which the Bacalhau CLI rejects.
      */
     protected String formatMemory(Object memory) {
         if (memory instanceof MemoryUnit) {
@@ -344,19 +332,19 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     }
 
     /**
-     * Format a Nextflow {@link Duration} into seconds (as required by
-     * Bacalhau's {@code Timeouts.ExecutionTimeout} field).
-     *
-     * FIX #7: Nextflow Duration.toString() can produce ISO-8601 strings like
-     * "PT10M" that the Bacalhau CLI does not accept.
+     * Format a {@link Duration} (or numeric value) into seconds for
+     * {@code Timeouts.ExecutionTimeout}. Returns 0 if unparseable — callers
+     * omit the timeout block in that case, leaving the task uncapped.
      */
     protected long formatTimeout(Object time) {
+        if (time == null) return 0L
         if (time instanceof Duration)
             return (time as Duration).toSeconds()
         try {
             return Long.parseLong(time.toString())
         } catch (Exception ignored) {
-            return DEFAULT_SUBMIT_TIMEOUT
+            log.warn "Could not parse execution timeout value: ${time}"
+            return 0L
         }
     }
 
@@ -395,7 +383,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     }
 
     // -------------------------------------------------------------------------
-    // Queue / status polling — FIX #5
+    // Queue / status polling
     // -------------------------------------------------------------------------
 
     /**
@@ -434,18 +422,47 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     }
 
     /**
-     * Fetch the current job list from the Bacalhau API, with per-poll-cycle
-     * caching so that multiple task handlers share a single CLI call.
-     *
-     * FIX #3: Without caching, N tasks trigger up to 2N CLI processes per poll.
-     * FIX #5: Drains both stdout/stderr to prevent pipe-buffer deadlock.
+     * Return a cached snapshot of the Bacalhau job list, refreshing it at most
+     * once every {@link #QUEUE_STATUS_CACHE_TTL_MS} ms. Only one thread fetches
+     * at a time; concurrent callers get the last known snapshot so the CLI
+     * call does not serialize the polling monitor.
      */
     protected Map<String, QueueStatus> getQueueStatus() {
-        final long now = System.currentTimeMillis()
-        if (now - cacheTimestamp.get() < QUEUE_STATUS_CACHE_TTL_MS) {
-            return cachedQueueStatus
+        synchronized (queueStatusLock) {
+            final long now = System.currentTimeMillis()
+            if (now - cacheTimestamp < QUEUE_STATUS_CACHE_TTL_MS || fetchInProgress)
+                return cachedQueueStatus
+            fetchInProgress = true
         }
 
+        try {
+            final Map<String, QueueStatus> result = fetchQueueStatus()
+            synchronized (queueStatusLock) {
+                if (result != null) {
+                    cachedQueueStatus = result
+                    cacheTimestamp = System.currentTimeMillis()
+                    return result
+                }
+                // Fetch failed — suppress retries for BACKOFF ms so a broken
+                // CLI doesn't get re-invoked on every poll.
+                cacheTimestamp = System.currentTimeMillis() +
+                    (QUEUE_STATUS_FAILURE_BACKOFF_MS - QUEUE_STATUS_CACHE_TTL_MS)
+                return cachedQueueStatus
+            }
+        } finally {
+            synchronized (queueStatusLock) {
+                fetchInProgress = false
+            }
+        }
+    }
+
+    /**
+     * Run {@code bacalhau job list --output json} and parse the result.
+     * Returns {@code null} on failure so callers can distinguish "empty
+     * queue" from "CLI error". Stdout and stderr are drained on background
+     * threads so the child process can exit cleanly.
+     */
+    private Map<String, QueueStatus> fetchQueueStatus() {
         log.debug "Fetching queue status from Bacalhau"
         Process proc = null
         try {
@@ -455,7 +472,6 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
             final StringBuilder stdout = new StringBuilder()
             final StringBuilder stderr = new StringBuilder()
 
-            // Drain both streams concurrently to prevent deadlock
             final Thread stdoutThread = Thread.start { proc.inputStream.eachLine  { stdout.append(it).append('\n') } }
             final Thread stderrThread = Thread.start { proc.errorStream.eachLine  { stderr.append(it).append('\n') } }
 
@@ -466,29 +482,26 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
             if (!finished) {
                 proc.destroyForcibly()
                 log.warn "Queue status command timed out after 60 s"
-                return [:]
+                return null
             }
 
             final int exitCode = proc.exitValue()
             if (exitCode != 0) {
                 log.warn "Queue status command exited ${exitCode}: ${stderr.toString().trim()}"
-                return [:]
+                return null
             }
 
-            final Map<String, QueueStatus> result = parseQueueStatus(stdout.toString())
-            cachedQueueStatus = result
-            cacheTimestamp.set(System.currentTimeMillis())
-            return result
+            return parseQueueStatus(stdout.toString())
         } catch (Exception e) {
             log.warn "Failed to get queue status: ${e.message}"
-            return [:]
+            return null
         } finally {
             if (proc?.isAlive()) proc.destroyForcibly()
         }
     }
 
     // -------------------------------------------------------------------------
-    // Task handler factory
+    // Task handler & monitor factories
     // -------------------------------------------------------------------------
 
     @Override
@@ -497,16 +510,29 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         return new BacalhauTaskHandler(task, this)
     }
 
+    /**
+     * Use {@link BacalhauTaskMonitor} instead of the HPC-tuned default.
+     * Without this override the custom monitor is dead code — Nextflow
+     * instantiates the generic {@link nextflow.processor.TaskPollingMonitor}
+     * with HPC-style polling intervals.
+     */
+    @Override
+    TaskMonitor createTaskMonitor() {
+        return BacalhauTaskMonitor.create(
+            session,
+            name,
+            BacalhauTaskMonitor.DEFAULT_POLL_INTERVAL,
+            BacalhauTaskMonitor.DEFAULT_QUEUE_SIZE)
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
     /**
-     * Check whether the Bacalhau CLI binary is available and responsive.
-     *
-     * FIX #6: The original {@code proc.waitFor()} had no timeout.  If the
-     * binary hangs (e.g. network wait on startup) the Nextflow thread would
-     * block indefinitely.  We now enforce a 30-second timeout.
+     * Check whether the Bacalhau CLI binary is available and responsive,
+     * bounded by a 30-second timeout so a hung binary doesn't stall the
+     * session.
      */
     private boolean isBacalhauAvailable() {
         Process proc = null
@@ -534,13 +560,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         }
     }
 
-    /**
-     * Map a Bacalhau job state string to a Nextflow {@link QueueStatus}.
-     *
-     * FIX #3: Changed from {@code private} to {@code protected} so that tests
-     * (and potential subclasses) can call it directly without hitting a
-     * compile-time access violation under {@code @CompileStatic}.
-     */
+    /** Map a Bacalhau job state string to a Nextflow {@link QueueStatus}. */
     protected QueueStatus parseJobStatus(String status) {
         switch (status?.toLowerCase()) {
             case 'queued':
@@ -564,12 +584,9 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         }
     }
 
-    /**
-     * Escape a string for safe inclusion in a YAML double-quoted scalar.
-     *
-     * FIX #1/#2: Prevents YAML injection by escaping backslashes, double
-     * quotes, newlines, carriage returns, and tabs before wrapping in quotes.
-     */
+    /** Escape a string for safe inclusion in a YAML double-quoted scalar.
+     *  Prevents YAML injection by escaping backslashes, quotes, and
+     *  whitespace control characters before wrapping in quotes. */
     protected static String yamlQuote(String value) {
         if (value == null) return '""'
         final String escaped = value
@@ -584,18 +601,22 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     /**
      * Validate and normalize a {@code host://} path to prevent path traversal.
      *
-     * FIX #8: Rejects paths containing {@code ..} components that could escape
-     * the intended mount scope.
+     * Rejects paths that contain a {@code ..} path segment (which would escape
+     * the intended mount scope). A plain substring match would spuriously
+     * reject legitimate paths like {@code /data/foo..bar/file}.
      *
-     * @throws IllegalArgumentException if the path contains traversal sequences
+     * @throws IllegalArgumentException if the path is empty or contains a
+     *         {@code ..} segment.
      */
     protected static String validateHostPath(String hostPath) {
         if (!hostPath || hostPath.trim().isEmpty())
             throw new IllegalArgumentException("host:// path must not be empty")
-        final String normalized = new File(hostPath).canonicalPath
-        if (hostPath.contains('..'))
+
+        final boolean hasParentSegment = hostPath.split('[/\\\\]').any { it == '..' }
+        if (hasParentSegment)
             throw new IllegalArgumentException(
                 "host:// path must not contain '..' traversal: ${hostPath}")
-        return normalized
+
+        return new File(hostPath).canonicalPath
     }
 }

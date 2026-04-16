@@ -16,6 +16,7 @@ package nextflow.executor
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
+import nextflow.executor.AbstractGridExecutor.QueueStatus
 import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
 import nextflow.trace.TraceRecord
@@ -32,22 +33,18 @@ import java.util.concurrent.TimeUnit
 @CompileStatic
 class BacalhauTaskHandler extends GridTaskHandler {
 
-    /** Bacalhau job ID assigned after successful submission */
-    private String bacalhauJobId
+    /** Bacalhau job ID assigned after successful submission.
+     *  Volatile because it's written by submit() and read by kill() and the
+     *  polling callbacks on different threads. A non-null value implies the
+     *  job was submitted successfully. */
+    private volatile String bacalhauJobId
 
-    /** Set to true once submit() has succeeded */
-    private volatile boolean jobSubmitted = false
-
-    /**
-     * FIX #8: Result retrieval is now performed on a dedicated background
-     * thread so that {@link #checkIfCompleted()} does not block the Nextflow
-     * task-polling monitor for up to 5 minutes per job.
-     *
-     * FIX #4: Uses a {@link CountDownLatch} instead of volatile booleans to
-     * guarantee happens-before between the retrieval thread's side effects
-     * (files written to disk) and the polling thread reading them.
-     */
+    // Result retrieval runs on a dedicated background thread so
+    // checkIfCompleted() does not block the polling monitor for up to 5
+    // minutes per job. The CountDownLatch gives a happens-before edge between
+    // the retrieval thread's disk writes and the polling thread reading them.
     private volatile boolean retrievalStarted = false
+    private volatile Thread retrievalThread
     private final CountDownLatch retrievalLatch = new CountDownLatch(1)
 
     // -------------------------------------------------------------------------
@@ -129,19 +126,18 @@ class BacalhauTaskHandler extends GridTaskHandler {
             log.info "Task ${task.name} submitted — Bacalhau job ID: ${bacalhauJobId}"
 
             synchronized (this) {
-                jobSubmitted = true
                 status = TaskStatus.SUBMITTED
             }
 
         } catch (InterruptedException e) {
             log.error "Task ${task.name} submission interrupted", e
-            status = TaskStatus.ERROR
+            markFailed(e, 1)
             Thread.currentThread().interrupt()
             throw new IllegalStateException("Job submission interrupted for task ${task.name}", e)
 
         } catch (Exception e) {
             log.error "Failed to submit task ${task.name} to Bacalhau", e
-            status = TaskStatus.ERROR
+            markFailed(e, 1)
             throw e
 
         } finally {
@@ -150,14 +146,27 @@ class BacalhauTaskHandler extends GridTaskHandler {
     }
 
     /**
-     * Kill a running Bacalhau job.
-     *
-     * FIX #6: Added a 30-second timeout to {@code proc.waitFor()} to prevent
-     * the calling thread from blocking indefinitely if the {@code bacalhau job
-     * stop} command hangs.
+     * Mark the task as failed. {@link TaskStatus} has no ERROR value, so
+     * failures are signalled by setting {@code task.error}, a non-zero
+     * {@code exitStatus}, and transitioning to {@link TaskStatus#COMPLETED}.
      */
+    private void markFailed(Throwable cause, int exitCode) {
+        synchronized (this) {
+            task.error      = cause
+            task.exitStatus = exitCode
+            status          = TaskStatus.COMPLETED
+        }
+    }
+
+    /** Kill a running Bacalhau job (bounded waitFor so a hanging CLI does not
+     *  block the caller indefinitely). Also interrupts the result-retrieval
+     *  thread if one is currently running. */
     @Override
     void kill() {
+        final Thread t = retrievalThread
+        if (t != null && t.isAlive())
+            t.interrupt()
+
         if (!bacalhauJobId) {
             log.warn "Cannot kill task ${task.name}: no job ID available"
             return
@@ -167,10 +176,9 @@ class BacalhauTaskHandler extends GridTaskHandler {
         try {
             final cmd  = getBacalhauExecutor().getKillCommand() + [bacalhauJobId]
             final proc = new ProcessBuilder(cmd).redirectErrorStream(true).start()
-            // Drain output so the process can exit
             Thread.start { proc.inputStream.eachLine { } }
 
-            final boolean finished = proc.waitFor(30, TimeUnit.SECONDS)  // FIX #6
+            final boolean finished = proc.waitFor(30, TimeUnit.SECONDS)
             if (!finished) {
                 proc.destroyForcibly()
                 log.warn "Kill command timed out for job ${bacalhauJobId}"
@@ -187,20 +195,20 @@ class BacalhauTaskHandler extends GridTaskHandler {
         }
     }
 
-    /**
-     * Return {@code true} if the job has transitioned to the RUNNING state.
-     */
+    /** Return {@code true} once the job has transitioned to RUNNING. */
     @Override
     boolean checkIfRunning() {
-        synchronized (this) {
-            if (!jobSubmitted || !bacalhauJobId) return false
-        }
+        if (bacalhauJobId == null) return false
 
         try {
             final queueStatus = getBacalhauExecutor().getQueueStatus()
             if (queueStatus.get(bacalhauJobId) == QueueStatus.RUNNING) {
-                synchronized (this) { status = TaskStatus.RUNNING }
-                log.debug "Task ${task.name} is RUNNING (job ID: ${bacalhauJobId})"
+                synchronized (this) {
+                    if (status != TaskStatus.RUNNING) {
+                        status = TaskStatus.RUNNING
+                        log.debug "Task ${task.name} is RUNNING (job ID: ${bacalhauJobId})"
+                    }
+                }
                 return true
             }
         } catch (Exception e) {
@@ -212,37 +220,33 @@ class BacalhauTaskHandler extends GridTaskHandler {
 
     /**
      * Return {@code true} once the job has finished and its results have been
-     * retrieved (or retrieval has been attempted and failed).
-     *
-     * FIX #8: Result retrieval ({@link #retrieveJobResults()}) used to run
-     * synchronously here, blocking the polling-monitor thread for up to 5
-     * minutes per completed job.  It is now started on a dedicated daemon
-     * thread and this method returns {@code false} until the retrieval thread
-     * signals completion via {@code retrievalCompleted}.
+     * retrieved (or retrieval has been attempted and failed). Returns
+     * {@code false} while the background retrieval thread is still running so
+     * the polling monitor is never blocked for more than a poll interval.
      */
     @Override
     boolean checkIfCompleted() {
-        synchronized (this) {
-            if (!jobSubmitted || !bacalhauJobId) return false
-        }
+        if (bacalhauJobId == null) return false
 
         try {
             final queueStatus = getBacalhauExecutor().getQueueStatus()
             final jobStatus   = queueStatus.get(bacalhauJobId)
 
             if (jobStatus == QueueStatus.DONE) {
-                // Start the retrieval thread exactly once
                 synchronized (this) {
                     if (!retrievalStarted) {
                         retrievalStarted = true
                         final String jobId = bacalhauJobId
-                        Thread.start {
+                        final Thread t = new Thread({
                             try {
                                 retrieveJobResults(jobId)
                             } finally {
                                 retrievalLatch.countDown()
                             }
-                        }
+                        } as Runnable, "bacalhau-retrieve-${task.name}")
+                        t.setDaemon(true)
+                        retrievalThread = t
+                        t.start()
                     }
                 }
 
@@ -266,20 +270,17 @@ class BacalhauTaskHandler extends GridTaskHandler {
 
             } else if (jobStatus == QueueStatus.ERROR) {
                 log.error "Task ${task.name} failed (job ID: ${bacalhauJobId})"
-                synchronized (this) {
-                    status          = TaskStatus.ERROR
-                    task.exitStatus = readExitFile() ?: 1
-                    task.error      = new RuntimeException("Bacalhau job ${bacalhauJobId} failed")
-                }
+                markFailed(
+                    new RuntimeException("Bacalhau job ${bacalhauJobId} failed"),
+                    readExitFile() ?: 1)
                 return true
             }
 
         } catch (Exception e) {
             log.error "Error checking completion status for task ${task.name}: ${e.message}", e
-            synchronized (this) {
-                status     = TaskStatus.ERROR
-                task.error = new RuntimeException("Failed to check job status: ${e.message}", e)
-            }
+            markFailed(
+                new RuntimeException("Failed to check job status: ${e.message}", e),
+                1)
             return true
         }
 
@@ -378,34 +379,35 @@ class BacalhauTaskHandler extends GridTaskHandler {
     }
 
     /**
-     * Extract a Bacalhau job ID (UUID or j-UUID format) from CLI output.
+     * Extract a Bacalhau job ID from CLI output.
      *
-     * Tries a strict whole-line match first, then falls back to finding a
-     * UUID anywhere in the output.
+     * Bacalhau's CLI emits IDs in the form {@code <prefix>-<UUID>} where
+     * {@code prefix} is typically {@code job} or {@code j} (depending on CLI
+     * version). We accept either — with prefix when present on the line, or
+     * falling back to the bare UUID otherwise.
      */
     private String extractJobId(String output) {
         if (!output?.trim()) return null
 
-        final uuidPattern  = /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/
-        final jobIdPattern = /(?:j-)?${uuidPattern}/
+        final uuidPattern     = /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/
+        final prefixedPattern = /(?:job|j)-${uuidPattern}/
 
         final String[] lines = output.trim().split('\n')
 
-        // Strict: full-line match
         for (String line : lines) {
-            final String trimmed = line.trim()
-            if (trimmed.matches(jobIdPattern)) {
-                log.debug "Extracted job ID: ${trimmed}"
-                return trimmed
+            final matcher = line =~ prefixedPattern
+            if (matcher.find()) {
+                final String jobId = matcher.group(0)
+                log.debug "Extracted job ID: ${jobId}"
+                return jobId
             }
         }
 
-        // Fallback: UUID embedded in a longer line
         for (String line : lines) {
             final matcher = line =~ uuidPattern
             if (matcher.find()) {
                 final String jobId = matcher.group(0)
-                log.debug "Extracted job ID from line: ${jobId}"
+                log.debug "Extracted bare UUID job ID: ${jobId}"
                 return jobId
             }
         }

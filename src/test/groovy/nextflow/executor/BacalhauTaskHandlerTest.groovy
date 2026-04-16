@@ -14,6 +14,7 @@
  */
 package nextflow.executor
 
+import nextflow.executor.AbstractGridExecutor.QueueStatus
 import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
 import spock.lang.Specification
@@ -101,7 +102,6 @@ job-87654321-dcba-4321-8765-210987654321
     def 'should check running status correctly'() {
         given:
         handler.@bacalhauJobId = 'test-job-123'
-        handler.@jobSubmitted = true
         executor.getQueueStatus() >> ['test-job-123': QueueStatus.RUNNING]
 
         when:
@@ -115,7 +115,6 @@ job-87654321-dcba-4321-8765-210987654321
     def 'should start retrieval on first completed check and finish on second'() {
         given:
         handler.@bacalhauJobId = 'test-job-123'
-        handler.@jobSubmitted = true
         executor.getQueueStatus() >> ['test-job-123': QueueStatus.DONE]
         executor.getBacalhauCli() >> 'bacalhau'
 
@@ -141,16 +140,16 @@ job-87654321-dcba-4321-8765-210987654321
     def 'should check error status correctly'() {
         given:
         handler.@bacalhauJobId = 'test-job-123'
-        handler.@jobSubmitted = true
         executor.getQueueStatus() >> ['test-job-123': QueueStatus.ERROR]
 
         when:
         def isCompleted = handler.checkIfCompleted()
 
-        then:
-        isCompleted == true
-        handler.status == TaskStatus.ERROR
-        task.error instanceof RuntimeException
+        then: 'errors are signalled via task.error + non-zero exit + COMPLETED status'
+        isCompleted
+        handler.status == TaskStatus.COMPLETED
+        1 * task.setError({ it instanceof RuntimeException })
+        1 * task.setExitStatus({ it != 0 })
     }
 
     def 'should return false for status checks when job not submitted'() {
