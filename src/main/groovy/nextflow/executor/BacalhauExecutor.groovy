@@ -58,6 +58,11 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     /** How long to suppress retries after a queue-status CLI failure. */
     private static final long QUEUE_STATUS_FAILURE_BACKOFF_MS = 10_000L
 
+    /** Max jobs to fetch per queue poll. Bacalhau's default is 10, which
+     *  silently truncates the result; we need all in-flight jobs visible so
+     *  the TaskMonitor sees every submitted job's state transitions. */
+    private static final int QUEUE_STATUS_LIMIT = 1000
+
     // -------------------------------------------------------------------------
     // Configuration (loaded once in initialize())
     // -------------------------------------------------------------------------
@@ -182,7 +187,12 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         // the mounted work dir (the contract Nextflow's GridTaskHandler expects).
         // Without this, `bacalhau job get` retrieves an empty workdir and
         // Nextflow fails with "Missing 'stdout' file".
+        //
+        // `cd` into the mounted workDir so relative paths in .command.sh
+        // resolve inside it — Nextflow writes output files with relative
+        // names and expects them in the workDir after the task completes.
         final String wrappedCmd =
+            "cd ${NEXTFLOW_SCRIPT_MOUNT} && " +
             "bash ${NEXTFLOW_SCRIPT_MOUNT}/${scriptName} " +
             "> ${NEXTFLOW_SCRIPT_MOUNT}/.command.out " +
             "2> ${NEXTFLOW_SCRIPT_MOUNT}/.command.err; " +
@@ -391,7 +401,8 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
 
     @Override
     List queueStatusCommand(Object queue) {
-        return [getBacalhauCli(), 'job', 'list', '--output', 'json']
+        return [getBacalhauCli(), 'job', 'list', '--output', 'json',
+                '--limit', String.valueOf(QUEUE_STATUS_LIMIT)]
     }
 
     // -------------------------------------------------------------------------
@@ -414,8 +425,18 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         if (!text?.trim())
             return result
 
+        // Bacalhau appends a pagination hint ("\nTo fetch more records use:\n…")
+        // after the JSON array when results are paginated. Strict JSON parsers
+        // reject this trailing non-JSON content, so truncate at the last ']'.
+        final String jsonPart = extractJsonArray(text)
+        if (!jsonPart) {
+            log.warn "Queue status output contained no JSON array"
+            log.debug "Raw content: ${text}"
+            return result
+        }
+
         try {
-            final jobs = new groovy.json.JsonSlurper().parseText(text)
+            final jobs = new groovy.json.JsonSlurper().parseText(jsonPart)
             final List jobList = jobs instanceof List ? jobs as List : [jobs]
             jobList.each { job ->
                 final Map jobMap = job as Map
@@ -431,6 +452,37 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         }
 
         return result
+    }
+
+    /**
+     * Return the substring from the first '[' through the matching closing ']'.
+     * Bacalhau's `job list --output json` prints a JSON array followed by a
+     * plain-text pagination footer; we need only the array.
+     *
+     * Returns {@code null} if no balanced array is found.
+     */
+    private static String extractJsonArray(String text) {
+        final int start = text.indexOf('[')
+        if (start < 0) return null
+        int depth = 0
+        boolean inString = false
+        boolean escape = false
+        for (int i = start; i < text.length(); i++) {
+            final char c = text.charAt(i)
+            if (escape) { escape = false; continue }
+            if (inString) {
+                if (c == (char) '\\') escape = true
+                else if (c == (char) '"') inString = false
+                continue
+            }
+            if (c == (char) '"') { inString = true; continue }
+            if (c == (char) '[') depth++
+            else if (c == (char) ']') {
+                depth--
+                if (depth == 0) return text.substring(start, i + 1)
+            }
+        }
+        return null
     }
 
     /**
@@ -478,7 +530,8 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         log.debug "Fetching queue status from Bacalhau"
         Process proc = null
         try {
-            final List<String> cmd = [getBacalhauCli(), 'job', 'list', '--output', 'json']
+            final List<String> cmd = [getBacalhauCli(), 'job', 'list', '--output', 'json',
+                                      '--limit', String.valueOf(QUEUE_STATUS_LIMIT)]
             proc = new ProcessBuilder(cmd).redirectErrorStream(false).start()
 
             final StringBuilder stdout = new StringBuilder()
