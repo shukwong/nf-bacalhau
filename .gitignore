@@ -45,3 +45,6 @@ work/
 *.bak
 *.swp
 *~
+
+# MkDocs generated site
+/site/
