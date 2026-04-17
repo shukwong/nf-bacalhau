@@ -39,6 +39,7 @@ work/
 .nextflow.log*
 *.html
 *.txt
+!docs/requirements.txt
 
 # Temporary files
 *.tmp
