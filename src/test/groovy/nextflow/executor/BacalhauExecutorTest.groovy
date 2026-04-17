@@ -448,6 +448,74 @@ class BacalhauExecutorTest extends Specification {
     }
 
     // -------------------------------------------------------------------------
+    // Output capture contract — regression test for end-to-end script staging
+    //
+    // The container must be able to write .command.out, .command.err and
+    // .exitcode back into the Nextflow work directory, otherwise Nextflow
+    // fails the task with "Missing 'stdout' file" after retrieval. This
+    // requires (a) a read-write mount of the work directory and (b) an
+    // entrypoint that redirects stdout/stderr and records the exit code.
+    // -------------------------------------------------------------------------
+
+    def 'job spec should mount script dir read-write for output capture'() {
+        given:
+        def task = Mock(TaskRun) {
+            getName() >> 'test-task'
+            getContainer() >> 'ubuntu:latest'
+            getWorkDir() >> tempDir
+            getConfig() >> Mock(TaskConfig) {
+                getCpus() >> 1
+                getMemory() >> null
+                getTime() >> null
+                getDisk() >> null
+                getAccelerator() >> null
+                get('ext') >> null
+            }
+            getEnvironment() >> null
+            getInputFilesMap() >> [:]
+        }
+
+        when:
+        def scriptFile = tempDir.resolve('.command.sh')
+        def yaml = executor.buildJobSpec(task, scriptFile, 'ubuntu:latest')
+
+        then:
+        // First InputSource is the script-dir mount. That specific mount
+        // must be ReadWrite: true so the container can write output files.
+        def firstMountBlock = yaml.split(/(?m)^      - Source:/)[1]
+        firstMountBlock.contains('Target: /nextflow-scripts')
+        firstMountBlock.contains('ReadWrite: true')
+    }
+
+    def 'job spec entrypoint should redirect stdout, stderr and exitcode'() {
+        given:
+        def task = Mock(TaskRun) {
+            getName() >> 'test-task'
+            getContainer() >> 'ubuntu:latest'
+            getWorkDir() >> tempDir
+            getConfig() >> Mock(TaskConfig) {
+                getCpus() >> 1
+                getMemory() >> null
+                getTime() >> null
+                getDisk() >> null
+                getAccelerator() >> null
+                get('ext') >> null
+            }
+            getEnvironment() >> null
+            getInputFilesMap() >> [:]
+        }
+
+        when:
+        def scriptFile = tempDir.resolve('.command.sh')
+        def yaml = executor.buildJobSpec(task, scriptFile, 'ubuntu:latest')
+
+        then:
+        yaml.contains('.command.out')
+        yaml.contains('.command.err')
+        yaml.contains('.exitcode')
+    }
+
+    // -------------------------------------------------------------------------
     // host:// path validation (FIX #8)
     // -------------------------------------------------------------------------
 

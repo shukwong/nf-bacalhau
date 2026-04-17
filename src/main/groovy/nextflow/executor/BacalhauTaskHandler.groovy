@@ -76,6 +76,14 @@ class BacalhauTaskHandler extends GridTaskHandler {
 
         Process proc = null
         try {
+            // Stage .command.sh and the run wrapper into task.workDir.
+            // GridTaskHandler's default submit() normally does this via
+            // createTaskWrapper(task).build(); since we override submit() to
+            // run the Bacalhau CLI directly, we must invoke the builder
+            // ourselves — otherwise the container mount contains only the
+            // YAML spec and bash aborts with "No such file or directory".
+            createTaskWrapper(task).build()
+
             final scriptFile = task.workDir.resolve(TaskRun.CMD_SCRIPT)
             final cmd        = getBacalhauExecutor().getSubmitCommandLine(task, scriptFile)
 

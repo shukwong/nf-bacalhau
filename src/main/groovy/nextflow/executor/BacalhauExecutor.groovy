@@ -178,20 +178,32 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         sb.append("      Type: docker\n")
         sb.append("      Params:\n")
         sb.append("        Image: ${yamlQuote(container)}\n")
+        // Wrap the user script so stdout/stderr/exit status are captured into
+        // the mounted work dir (the contract Nextflow's GridTaskHandler expects).
+        // Without this, `bacalhau job get` retrieves an empty workdir and
+        // Nextflow fails with "Missing 'stdout' file".
+        final String wrappedCmd =
+            "bash ${NEXTFLOW_SCRIPT_MOUNT}/${scriptName} " +
+            "> ${NEXTFLOW_SCRIPT_MOUNT}/.command.out " +
+            "2> ${NEXTFLOW_SCRIPT_MOUNT}/.command.err; " +
+            "echo \$? > ${NEXTFLOW_SCRIPT_MOUNT}/.exitcode"
         sb.append("        Entrypoint:\n")
         sb.append("          - bash\n")
-        sb.append("          - ${yamlQuote("${NEXTFLOW_SCRIPT_MOUNT}/${scriptName}")}\n")
+        sb.append("          - \"-c\"\n")
+        sb.append("          - ${yamlQuote(wrappedCmd)}\n")
 
         // --- Input sources ---
         sb.append("    InputSources:\n")
 
         // Script file: mount its parent directory at a dedicated path so we
         // don't overlay the container's /tmp (which many images rely on).
+        // Must be ReadWrite so the entrypoint can write .command.out /
+        // .command.err / .exitcode back to the Nextflow work directory.
         sb.append("      - Source:\n")
         sb.append("          Type: localDirectory\n")
         sb.append("          Params:\n")
         sb.append("            SourcePath: ${yamlQuote(scriptDir)}\n")
-        sb.append("            ReadWrite: false\n")
+        sb.append("            ReadWrite: true\n")
         sb.append("        Target: ${NEXTFLOW_SCRIPT_MOUNT}\n")
 
         // Task input files
