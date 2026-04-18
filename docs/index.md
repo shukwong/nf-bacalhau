@@ -66,6 +66,11 @@ Next: [install the plugin](installation.md) or skip ahead to the
 [federated allele-frequency demo](examples/federated-af.md) that exercises the
 full pipeline against a local Bacalhau node.
 
+Running the federation across multiple sites? See the
+[Federation Dashboard guide](federation-dashboard.md) — it walks through
+running a coordinator at each site, registering them in the dashboard,
+launching runs, and the end-to-end privacy contract.
+
 ## The privacy story
 
 The most compelling use case for *compute-to-data* is federated genomics.
