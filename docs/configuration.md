@@ -7,7 +7,7 @@ files. Options can live under a dedicated `bacalhau { }` scope (preferred) or
 ## Minimal configuration
 
 ```groovy
-plugins { id 'nf-bacalhau@0.1.0-SNAPSHOT' }
+plugins { id 'nf-bacalhau@0.1.0' }
 
 process {
     executor = 'bacalhau'
@@ -17,7 +17,7 @@ process {
 ## Full configuration
 
 ```groovy
-plugins { id 'nf-bacalhau@0.1.0-SNAPSHOT' }
+plugins { id 'nf-bacalhau@0.1.0' }
 
 bacalhau {
     bacalhauCliPath   = 'bacalhau'                   // CLI binary

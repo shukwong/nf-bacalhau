@@ -22,17 +22,17 @@ src/test/groovy/
 ## Build & test
 
 ```bash
-export JAVA_HOME=$(/usr/libexec/java_home -v 17)    # macOS
-./gradlew build                 # compile + unit tests
-./gradlew test                  # unit tests only
-./gradlew integrationTest       # requires a running Bacalhau node
-./gradlew publishToMavenLocal   # publish 0.1.0-SNAPSHOT to ~/.m2
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)    # macOS
+make assemble                   # compile + package the plugin
+make test                       # unit tests
+make integration-test           # requires a running Bacalhau node
+make install                    # stage plugin into ~/.nextflow/plugins/
 ```
 
 ## Pull-request checklist
 
 - [ ] Tests updated or added for the change.
-- [ ] `./gradlew build` passes.
+- [ ] `make assemble test` passes.
 - [ ] The federated-af demo still runs end-to-end
       (`./examples/federated-af/run.sh --skip-bacalhau`).
 - [ ] Commit message uses Conventional Commits (`fix:`, `feat:`, `docs:`, …).

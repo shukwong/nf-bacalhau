@@ -1,7 +1,0 @@
-Manifest-Version: 1.0
-Plugin-Class: nextflow.bacalhau.BacalhauPlugin
-Plugin-Id: nf-bacalhau
-Plugin-Version: 0.1.0-SNAPSHOT
-Plugin-Provider: Nextflow
-Plugin-Description: Nextflow executor for Bacalhau distributed compute
-Plugin-License: Apache License 2.0

@@ -20,21 +20,23 @@
 
 ## In progress (Phase 4)
 
+- [x] Packaged for the Nextflow plugin registry via `io.nextflow.nextflow-plugin`
+- [ ] First public release to the plugin registry (requires provider claim)
 - [ ] Performance tuning and optimization
 - [ ] Extensive integration testing against a multi-node Bacalhau cluster
 - [ ] Advanced networking configuration
 - [ ] Benchmarking against Slurm / AWS Batch / Kubernetes for the genomics
       reference workload
-- [ ] Publication of the plugin to the Nextflow plugin registry
 - [ ] Expanded documentation and end-to-end examples
 
 ## Known limitations
 
-- **Plugin is built locally, not registry-hosted.** Until publication, users
-  must `./gradlew assemble` and stage the JAR manually (or via the bundled
-  runner scripts).
-- **Nextflow 23.10.x only.** Newer Nextflow versions change internal APIs;
-  a 25.x port is on the roadmap.
+- **Registry publication pending.** The plugin is packaged and ready for
+  `./gradlew releasePlugin`, but the `nf-bacalhau` provider still needs to
+  be claimed at <https://registry.nextflow.io/claim-plugin>. Until that
+  ships, users install via `make install` (local staging).
+- **Nextflow 24.10.0 or later required.** The plugin manifest declares
+  `Plugin-Requires: >=24.10.0`; Nextflow 23.10.x refuses to load it.
 - **CLI dependency.** The executor shells out to the Bacalhau CLI; future
   work will evaluate a native client library when one becomes available.
 - **Queue status is cached, not event-driven.** Large workflows (thousands

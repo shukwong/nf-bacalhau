@@ -3,7 +3,7 @@
 # End-to-end test runner for the nf-bacalhau plugin.
 #
 # What this does:
-#   1. Verifies prerequisites (Docker, bacalhau, Nextflow 23.10.x).
+#   1. Verifies prerequisites (Docker, bacalhau, Nextflow 24.10+).
 #   2. Builds and stages the plugin into ~/.nextflow/plugins/.
 #   3. Starts a local Bacalhau compute node (if one is not already running)
 #      with writable AllowListedLocalPaths for /tmp and /private/tmp.
@@ -19,7 +19,7 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLUGIN_VERSION="0.1.0-SNAPSHOT"
+PLUGIN_VERSION="0.1.0"
 PLUGIN_ID="nf-bacalhau"
 PLUGIN_DIR="$HOME/.nextflow/plugins/${PLUGIN_ID}-${PLUGIN_VERSION}"
 PLUGIN_JAR="${PROJECT_ROOT}/build/libs/${PLUGIN_ID}-${PLUGIN_VERSION}.jar"
@@ -53,7 +53,7 @@ log "Checking prerequisites"
 command -v docker    >/dev/null || fail "docker CLI not found"
 command -v bacalhau  >/dev/null || fail "bacalhau CLI not found (install from https://docs.bacalhau.org)"
 command -v "$NEXTFLOW_BIN" >/dev/null || \
-  fail "Nextflow 23.10.x binary '$NEXTFLOW_BIN' not found. Set NEXTFLOW_BIN or install Nextflow 23.10.1."
+  fail "Nextflow binary '$NEXTFLOW_BIN' not found. Set NEXTFLOW_BIN or install Nextflow >=24.10.0 (plugin manifest requires it)."
 
 docker info >/dev/null 2>&1 || fail "Docker daemon is not running"
 

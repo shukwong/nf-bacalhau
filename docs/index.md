@@ -43,7 +43,7 @@ workflow {
 ```
 
 ```groovy title="nextflow.config"
-plugins { id 'nf-bacalhau@0.1.0-SNAPSHOT' }
+plugins { id 'nf-bacalhau@0.1.0' }
 
 process {
     executor  = 'bacalhau'
