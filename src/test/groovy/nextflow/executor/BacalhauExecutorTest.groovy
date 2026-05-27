@@ -100,6 +100,39 @@ class BacalhauExecutorTest extends Specification {
         tempDir.resolve('.bacalhau-job.yaml').exists()
     }
 
+    def 'should apply configured api host to every Bacalhau command'() {
+        given:
+        executor.@bacalhauNode = 'http://localhost:1234'
+        def task = Mock(TaskRun) {
+            getName() >> 'test-task'
+            getContainer() >> 'ubuntu:latest'
+            getWorkDir() >> tempDir
+            getConfig() >> Mock(TaskConfig) {
+                getCpus()        >> 1
+                getMemory()      >> null
+                getTime()        >> null
+                getDisk()        >> null
+                getAccelerator() >> null
+                get('ext')       >> null
+            }
+            getEnvironment() >> null
+            getInputFilesMap() >> [:]
+        }
+
+        when:
+        def submit = executor.getSubmitCommandLine(task, tempDir.resolve('script.sh'))
+        def list = executor.queueStatusCommand(null)
+        def stop = executor.getKillCommand()
+        def get = executor.getJobGetCommand('job-12345678-abcd-1234-5678-123456789012', tempDir)
+
+        then:
+        [submit, list, stop, get].each { cmd ->
+            assert cmd[0] == 'bacalhau'
+            assert cmd[1] == '--api-host'
+            assert cmd[2] == 'http://localhost:1234'
+        }
+    }
+
     def 'should embed correct container image in the YAML spec'() {
         given:
         def task = Mock(TaskRun) {

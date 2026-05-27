@@ -49,12 +49,12 @@ Nextflow process directives map to Bacalhau job YAML as follows:
 | `container`                   | `Engine.Params.Image`                       |
 | script (`.command.sh`)        | workDir mounted rw at `/nextflow-scripts`   |
 | `input: path x`               | `InputSources[].Type = localDirectory`      |
-| `input: val 's3://...'`       | `InputSources[].Type = s3`                  |
-| `input: val 'host:///...'`    | `InputSources[].Type = localDirectory` (rw) |
+| `input: path 's3://...'`      | `InputSources[].Type = s3`                  |
+| `input: path 'host:///...'`   | `InputSources[].Type = localDirectory` (ro) |
 | `cpus`, `memory`, `disk`      | `Resources.{CPU,Memory,Disk}`               |
 | `time`                        | `Timeouts.ExecutionTimeout`                 |
 | `accelerator`                 | `Resources.GPU`                             |
-| `ext.bacalhauSecrets`         | `Engine.Params.EnvironmentVariables`        |
+| `ext.bacalhauSecrets`         | `Env` entries in the Bacalhau task spec     |
 
 The wrapped entrypoint is:
 
@@ -94,3 +94,7 @@ suppressed for `QUEUE_STATUS_FAILURE_BACKOFF_MS` (10 s).
 - **Workspace mount + cd, not working-dir container setting** — Bacalhau's
   `Engine.Params` does not expose a reliable CWD knob across runtimes;
   `cd /nextflow-scripts && bash ...` is portable.
+- **Local directory staging for local files** — the current implementation
+  assumes the Bacalhau compute node can access the task work directory and
+  local path inputs directly. Use S3 inputs for data that should be fetched by
+  remote workers without shared filesystem access.

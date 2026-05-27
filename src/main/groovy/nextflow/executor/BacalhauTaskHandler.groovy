@@ -21,6 +21,7 @@ import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
 import nextflow.trace.TraceRecord
 
+import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -45,6 +46,7 @@ class BacalhauTaskHandler extends GridTaskHandler {
     // the retrieval thread's disk writes and the polling thread reading them.
     private volatile boolean retrievalStarted = false
     private volatile Thread retrievalThread
+    private volatile Throwable retrievalError
     private final CountDownLatch retrievalLatch = new CountDownLatch(1)
 
     // -------------------------------------------------------------------------
@@ -248,6 +250,8 @@ class BacalhauTaskHandler extends GridTaskHandler {
                         final Thread t = new Thread({
                             try {
                                 retrieveJobResults(jobId)
+                            } catch (Throwable e) {
+                                retrievalError = e
                             } finally {
                                 retrievalLatch.countDown()
                             }
@@ -266,10 +270,26 @@ class BacalhauTaskHandler extends GridTaskHandler {
 
                 // Latch is at zero — retrieval thread has finished and all its
                 // memory effects are visible (CountDownLatch guarantees happens-before).
+                if (retrievalError != null) {
+                    log.error "Task ${task.name}: result retrieval failed for job ${bacalhauJobId}", retrievalError
+                    markFailed(
+                        new RuntimeException("Failed to retrieve Bacalhau results for job ${bacalhauJobId}", retrievalError),
+                        1)
+                    return true
+                }
+
                 verifyOutputFiles()
+                final Integer exitStatus = readExitFile()
+                if (exitStatus == null) {
+                    markFailed(
+                        new RuntimeException("Task ${task.name}: missing or invalid ${TaskRun.CMD_EXIT} after result retrieval"),
+                        1)
+                    return true
+                }
+
                 synchronized (this) {
                     status          = TaskStatus.COMPLETED
-                    task.exitStatus = readExitFile() ?: 0
+                    task.exitStatus = exitStatus
                     task.stdout     = task.workDir.resolve(TaskRun.CMD_OUTFILE)
                     task.stderr     = task.workDir.resolve(TaskRun.CMD_ERRFILE)
                 }
@@ -320,20 +340,15 @@ class BacalhauTaskHandler extends GridTaskHandler {
      * Download job outputs to the task work directory.
      *
      * Called on a background thread (see {@link #checkIfCompleted()}).
-     * Any exception is caught and logged so the retrieval thread always
-     * sets {@code retrievalCompleted = true}.
+     * Exceptions propagate to the retrieval thread wrapper, which records
+     * them so {@link #checkIfCompleted()} can fail the task explicitly.
      */
     private void retrieveJobResults(String jobId) {
         log.debug "Retrieving results for job ${jobId}"
 
         Process proc = null
         try {
-            final cmd = [
-                getBacalhauExecutor().getBacalhauCli(),
-                'job', 'get',
-                jobId,
-                '--output-dir', task.workDir.toString()
-            ]
+            final cmd = getBacalhauExecutor().getJobGetCommand(jobId, task.workDir)
 
             log.info "Retrieving results for task ${task.name}: ${cmd.join(' ')}"
             proc = new ProcessBuilder(cmd)
@@ -354,36 +369,36 @@ class BacalhauTaskHandler extends GridTaskHandler {
 
             if (!finished) {
                 proc.destroyForcibly()
-                log.warn "Result retrieval timed out for job ${jobId}"
-                return
+                throw new IllegalStateException("Result retrieval timed out for job ${jobId}")
             }
 
             final int exitCode = proc.exitValue()
             if (exitCode != 0) {
-                log.warn "Result retrieval failed for job ${jobId} (exit ${exitCode}): ${stderr.toString().trim()}"
+                throw new IllegalStateException(
+                    "Result retrieval failed for job ${jobId} (exit ${exitCode}): ${stderr.toString().trim()}")
             } else {
                 log.info "Results retrieved for task ${task.name} (job ID: ${jobId})"
             }
 
         } catch (InterruptedException e) {
-            log.warn "Result retrieval interrupted for job ${jobId}"
             Thread.currentThread().interrupt()
-        } catch (Exception e) {
-            log.warn "Error retrieving results for job ${jobId}: ${e.message}", e
+            throw new IllegalStateException("Result retrieval interrupted for job ${jobId}", e)
         } finally {
             if (proc?.isAlive()) proc.destroyForcibly()
         }
     }
 
-    /** Warn if expected output files are absent after result retrieval. */
+    /** Fail if expected output files are absent after result retrieval. */
     private void verifyOutputFiles() {
         final exitFile = task.workDir.resolve(TaskRun.CMD_EXIT)
         final outFile  = task.workDir.resolve(TaskRun.CMD_OUTFILE)
         final errFile  = task.workDir.resolve(TaskRun.CMD_ERRFILE)
 
-        if (!exitFile.exists()) log.warn "Task ${task.name}: exit file not found at ${exitFile}"
-        if (!outFile.exists())  log.debug "Task ${task.name}: stdout file not found at ${outFile}"
-        if (!errFile.exists())  log.debug "Task ${task.name}: stderr file not found at ${errFile}"
+        final List<Path> missing = [exitFile, outFile, errFile].findAll { !it.exists() } as List<Path>
+        if (missing) {
+            throw new IllegalStateException(
+                "Task ${task.name}: missing expected result file(s): ${missing*.fileName.join(', ')}")
+        }
     }
 
     /**

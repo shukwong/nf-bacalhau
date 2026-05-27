@@ -12,6 +12,8 @@
 - [x] Host-path input support (`host://` URIs)
 - [x] Secret injection via `ext.bacalhauSecrets`
 - [x] Comprehensive error handling with timeouts
+- [x] Result retrieval failures fail the task instead of defaulting to success
+- [x] Consistent Bacalhau API endpoint use across submit, poll, stop, and get
 - [x] Configuration validation and loading
 - [x] Thread-safe synchronization in queue-status cache
 - [x] Strict job-ID validation
@@ -37,9 +39,17 @@
   a 25.x port is on the roadmap.
 - **CLI dependency.** The executor shells out to the Bacalhau CLI; future
   work will evaluate a native client library when one becomes available.
+- **Local-path staging requires path visibility.** Local `path` inputs and the
+  task work directory are mounted as Bacalhau `localDirectory` sources, so
+  compute nodes must be local or share those paths. Use S3 input sources for
+  remote object data.
 - **Queue status is cached, not event-driven.** Large workflows (thousands
   of concurrent tasks) will spend noticeable wall-time in the 5-second poll
   cycle. A subscribe-based model is a future optimization.
+- **Coordinator/dashboard are demo security.** Coordinator `/runs` and
+  `/counts` routes require the configured bearer token, but the demo uses one
+  shared operator token for read and write privileges. Dashboard operator
+  tokens are kept in browser localStorage.
 
 ## Where to get help
 

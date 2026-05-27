@@ -112,11 +112,15 @@ job-87654321-dcba-4321-8765-210987654321
         handler.status == TaskStatus.RUNNING
     }
 
-    def 'should start retrieval on first completed check and finish on second'() {
+    def 'should retrieve result files before marking completed job successful'() {
         given:
         handler.@bacalhauJobId = 'test-job-123'
         executor.getQueueStatus() >> ['test-job-123': QueueStatus.DONE]
-        executor.getBacalhauCli() >> 'bacalhau'
+        executor.getJobGetCommand('test-job-123', workDir) >> [
+            '/bin/sh',
+            '-c',
+            "printf 0 > ${TaskRun.CMD_EXIT}; : > ${TaskRun.CMD_OUTFILE}; : > ${TaskRun.CMD_ERRFILE}"
+        ]
 
         when: 'first call starts retrieval thread'
         def firstCheck = handler.checkIfCompleted()
@@ -135,6 +139,45 @@ job-87654321-dcba-4321-8765-210987654321
         then: 'now completes'
         secondCheck == true
         handler.status == TaskStatus.COMPLETED
+        1 * task.setExitStatus(0)
+        1 * task.setStdout(workDir.resolve(TaskRun.CMD_OUTFILE))
+        1 * task.setStderr(workDir.resolve(TaskRun.CMD_ERRFILE))
+    }
+
+    def 'should fail completed job when result retrieval fails'() {
+        given:
+        handler.@bacalhauJobId = 'test-job-123'
+        executor.getQueueStatus() >> ['test-job-123': QueueStatus.DONE]
+        executor.getJobGetCommand('test-job-123', workDir) >> ['/bin/sh', '-c', 'exit 2']
+
+        when:
+        handler.checkIfCompleted()
+        Thread.sleep(500)
+        def secondCheck = handler.checkIfCompleted()
+
+        then:
+        secondCheck
+        handler.status == TaskStatus.COMPLETED
+        1 * task.setError({ it instanceof RuntimeException })
+        1 * task.setExitStatus(1)
+    }
+
+    def 'should fail completed job when retrieved result files are missing'() {
+        given:
+        handler.@bacalhauJobId = 'test-job-123'
+        executor.getQueueStatus() >> ['test-job-123': QueueStatus.DONE]
+        executor.getJobGetCommand('test-job-123', workDir) >> ['/bin/sh', '-c', 'exit 0']
+
+        when:
+        handler.checkIfCompleted()
+        Thread.sleep(500)
+        def secondCheck = handler.checkIfCompleted()
+
+        then:
+        secondCheck
+        handler.status == TaskStatus.COMPLETED
+        1 * task.setError({ it instanceof RuntimeException })
+        1 * task.setExitStatus(1)
     }
 
     def 'should check error status correctly'() {

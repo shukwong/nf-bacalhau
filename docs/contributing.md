@@ -16,7 +16,10 @@ src/main/resources/META-INF/
 
 src/test/groovy/
 ├── BacalhauExecutorTest.groovy    # Unit tests
-└── BacalhauIntegrationTest.groovy # Integration tests
+└── BacalhauTaskHandlerTest.groovy # Unit tests
+
+src/integrationTest/groovy/
+└── BacalhauIntegrationTest.groovy # Opt-in live Bacalhau smoke tests
 ```
 
 ## Build & test
@@ -25,8 +28,29 @@ src/test/groovy/
 export JAVA_HOME=$(/usr/libexec/java_home -v 17)    # macOS
 ./gradlew build                 # compile + unit tests
 ./gradlew test                  # unit tests only
-./gradlew integrationTest       # requires a running Bacalhau node
+BACALHAU_INTEGRATION=1 ./gradlew integrationTest
 ./gradlew publishToMavenLocal   # publish 0.1.0-SNAPSHOT to ~/.m2
+```
+
+Dashboard checks:
+
+```bash
+cd dashboard
+npm ci
+npm audit
+npm run typecheck
+npm test
+npm run build
+```
+
+Coordinator checks:
+
+```bash
+cd site-coordinator
+pip install -e ".[dev]"
+ruff check .
+mypy
+pytest
 ```
 
 ## Pull-request checklist

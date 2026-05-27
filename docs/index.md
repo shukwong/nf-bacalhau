@@ -1,6 +1,6 @@
 # Nextflow on Bacalhau
 
-**Run Nextflow workflows on [Bacalhau](https://bacalhau.org)'s distributed compute network — bring the compute to the data instead of moving data to the compute.**
+**Run Nextflow workflows on a configured [Bacalhau](https://bacalhau.org) orchestrator, with S3 and node-local inputs for compute-near-data workflows.**
 
 ## Why this plugin
 
@@ -12,10 +12,10 @@ cluster:
 - **Geographically distributed sensor data** where bandwidth dominates runtime.
 - **Public S3-hosted reference data** you want to process without egress fees.
 
-Bacalhau orchestrates containers *next to the node that holds the data*. This
-plugin lets any Nextflow pipeline target Bacalhau as its executor — your
-processes, directives, and channels are unchanged; only the execution layer
-moves to a data-local compute network.
+Bacalhau orchestrates containers where data is available. This plugin lets
+Nextflow target Bacalhau as its executor while preserving normal process
+directives. Current local file staging requires a local node or shared
+filesystem; use S3 inputs for remote object data.
 
 ## What you get
 
@@ -51,10 +51,7 @@ process {
 }
 
 bacalhau {
-    bacalhauNode      = 'http://localhost:1234'
-    waitForCompletion = true
-    maxRetries        = 1
-    storageEngine     = 'local'
+    bacalhauNode = 'http://localhost:1234'
 }
 ```
 

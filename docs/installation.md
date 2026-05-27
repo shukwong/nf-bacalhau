@@ -5,8 +5,8 @@
 | Component | Version | Notes |
 |---|---|---|
 | Bacalhau CLI | 1.7.x | [Install guide](https://docs.bacalhau.org/getting-started/installation) |
-| Nextflow | 23.10.1 or later | |
-| Java | 17 (build), 11+ (run) | OpenJDK 17 recommended for building the plugin |
+| Nextflow | 23.10.x | Newer Nextflow internal APIs are not yet supported |
+| Java | 17 | Required for building and for Nextflow 23.10.x in the tested setup |
 | Docker | any current release | Only required if you want to run the compute node locally |
 
 ## Install from source

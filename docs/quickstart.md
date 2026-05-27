@@ -32,9 +32,6 @@ plugins { id 'nf-bacalhau@0.1.0-SNAPSHOT' }
 bacalhau {
     bacalhauCliPath   = 'bacalhau'
     bacalhauNode      = 'http://localhost:1234'
-    waitForCompletion = true
-    maxRetries        = 1
-    storageEngine     = 'local'
 }
 
 process {

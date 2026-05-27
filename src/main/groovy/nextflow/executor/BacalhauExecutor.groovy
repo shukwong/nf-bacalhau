@@ -68,9 +68,6 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
     // -------------------------------------------------------------------------
     private String bacalhauCliPath
     private String bacalhauNode
-    private Boolean waitForCompletion
-    private Integer maxRetries
-    private String storageEngine
     private String s3Region
 
     // Queue-status cache. Reads and writes of the cache fields go through
@@ -112,24 +109,35 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
 
         bacalhauCliPath   = config.bacalhauCliPath?.toString() ?: BACALHAU_CLI
         bacalhauNode      = config.bacalhauNode?.toString()    ?: DEFAULT_API_ENDPOINT
-        waitForCompletion = config.waitForCompletion != null ? config.waitForCompletion as Boolean : true
-        maxRetries        = config.maxRetries != null ? (config.maxRetries as Integer) : 3
-
-        if (maxRetries < 0)
-            throw new IllegalArgumentException("maxRetries must be non-negative, got: ${maxRetries}")
-
-        storageEngine = config.storageEngine?.toString() ?: 'ipfs'
-        if (!['ipfs', 's3', 'local'].contains(storageEngine))
-            log.warn "Unknown storage engine: ${storageEngine}"
-
         s3Region = config.s3Region?.toString() ?: 'us-east-1'
 
-        log.debug "Config loaded — CLI: ${bacalhauCliPath}, node: ${bacalhauNode}, maxRetries: ${maxRetries}, s3Region: ${s3Region}"
+        if (config.containsKey('waitForCompletion'))
+            log.warn "bacalhau.waitForCompletion is ignored; nf-bacalhau always submits asynchronously and polls job status"
+        if (config.containsKey('maxRetries'))
+            log.warn "bacalhau.maxRetries is ignored; use Nextflow process.errorStrategy/process.maxRetries instead"
+        if (config.containsKey('storageEngine'))
+            log.warn "bacalhau.storageEngine is ignored; current local path staging requires node-local or shared filesystem access"
+
+        log.debug "Config loaded — CLI: ${bacalhauCliPath}, node: ${bacalhauNode}, s3Region: ${s3Region}"
     }
 
     /** Return the configured path to the Bacalhau binary. */
     String getBacalhauCli() {
         return bacalhauCliPath ?: BACALHAU_CLI
+    }
+
+    /**
+     * Build a Bacalhau CLI command with the configured API endpoint applied
+     * consistently. Use a root-level flag so every sub-command targets the
+     * same orchestrator.
+     */
+    protected List<String> bacalhauCommand(List<String> args) {
+        final List<String> cmd = [getBacalhauCli()]
+        if (bacalhauNode && bacalhauNode != DEFAULT_API_ENDPOINT) {
+            cmd << '--api-host' << bacalhauNode
+        }
+        cmd.addAll(args)
+        return cmd
     }
 
     // -------------------------------------------------------------------------
@@ -154,14 +162,11 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         specFile.text = specContent
         log.debug "Written Bacalhau job spec to: ${specFile}"
 
-        final List<String> cmd = [getBacalhauCli(), 'job', 'run']
-
-        // Override the API host when a non-default endpoint is configured
-        if (bacalhauNode && bacalhauNode != DEFAULT_API_ENDPOINT) {
-            cmd << '--api-host' << bacalhauNode
-        }
-
-        cmd << specFile.toAbsolutePath().toString()
+        final List<String> cmd = bacalhauCommand([
+            'job',
+            'run',
+            specFile.toAbsolutePath().toString()
+        ])
 
         log.debug "Submit command: ${cmd.join(' ')}"
         return cmd
@@ -376,7 +381,18 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
 
     @Override
     protected List<String> getKillCommand() {
-        return [getBacalhauCli(), 'job', 'stop']
+        return bacalhauCommand(['job', 'stop'])
+    }
+
+    /** Build the command used to retrieve completed job outputs. */
+    protected List<String> getJobGetCommand(String jobId, Path outputDir) {
+        return bacalhauCommand([
+            'job',
+            'get',
+            jobId,
+            '--output-dir',
+            outputDir.toString()
+        ])
     }
 
     /**
@@ -401,8 +417,14 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
 
     @Override
     List queueStatusCommand(Object queue) {
-        return [getBacalhauCli(), 'job', 'list', '--output', 'json',
-                '--limit', String.valueOf(QUEUE_STATUS_LIMIT)]
+        return bacalhauCommand([
+            'job',
+            'list',
+            '--output',
+            'json',
+            '--limit',
+            String.valueOf(QUEUE_STATUS_LIMIT)
+        ])
     }
 
     // -------------------------------------------------------------------------
@@ -530,8 +552,7 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
         log.debug "Fetching queue status from Bacalhau"
         Process proc = null
         try {
-            final List<String> cmd = [getBacalhauCli(), 'job', 'list', '--output', 'json',
-                                      '--limit', String.valueOf(QUEUE_STATUS_LIMIT)]
+            final List<String> cmd = queueStatusCommand(null) as List<String>
             proc = new ProcessBuilder(cmd).redirectErrorStream(false).start()
 
             final StringBuilder stdout = new StringBuilder()
