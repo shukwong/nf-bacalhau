@@ -22,6 +22,7 @@ import spock.lang.Subject
 
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.TimeUnit
 
 /**
  * Unit tests for BacalhauTaskHandler
@@ -119,7 +120,7 @@ job-87654321-dcba-4321-8765-210987654321
         executor.getJobGetCommand('test-job-123', workDir) >> [
             '/bin/sh',
             '-c',
-            "printf 0 > ${TaskRun.CMD_EXIT}; : > ${TaskRun.CMD_OUTFILE}; : > ${TaskRun.CMD_ERRFILE}"
+            "printf 0 > ${TaskRun.CMD_EXIT}"
         ]
 
         when: 'first call starts retrieval thread'
@@ -131,9 +132,7 @@ job-87654321-dcba-4321-8765-210987654321
         firstCheck == false || firstCheck == true
 
         when: 'wait for retrieval to complete then check again'
-        // Give the background thread time to finish (it will fail since bacalhau CLI is not available,
-        // but the latch will still count down via the finally block)
-        Thread.sleep(500)
+        assert handler.@retrievalLatch.await(2, TimeUnit.SECONDS)
         def secondCheck = handler.checkIfCompleted()
 
         then: 'now completes'
@@ -152,7 +151,7 @@ job-87654321-dcba-4321-8765-210987654321
 
         when:
         handler.checkIfCompleted()
-        Thread.sleep(500)
+        assert handler.@retrievalLatch.await(2, TimeUnit.SECONDS)
         def secondCheck = handler.checkIfCompleted()
 
         then:
@@ -162,7 +161,7 @@ job-87654321-dcba-4321-8765-210987654321
         1 * task.setExitStatus(1)
     }
 
-    def 'should fail completed job when retrieved result files are missing'() {
+    def 'should fail completed job when retrieved exit file is missing'() {
         given:
         handler.@bacalhauJobId = 'test-job-123'
         executor.getQueueStatus() >> ['test-job-123': QueueStatus.DONE]
@@ -170,7 +169,7 @@ job-87654321-dcba-4321-8765-210987654321
 
         when:
         handler.checkIfCompleted()
-        Thread.sleep(500)
+        assert handler.@retrievalLatch.await(2, TimeUnit.SECONDS)
         def secondCheck = handler.checkIfCompleted()
 
         then:

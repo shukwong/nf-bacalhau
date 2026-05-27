@@ -21,7 +21,6 @@ import nextflow.processor.TaskRun
 import nextflow.processor.TaskStatus
 import nextflow.trace.TraceRecord
 
-import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -388,17 +387,18 @@ class BacalhauTaskHandler extends GridTaskHandler {
         }
     }
 
-    /** Fail if expected output files are absent after result retrieval. */
+    /** Fail if the required exit file is absent after result retrieval. */
     private void verifyOutputFiles() {
         final exitFile = task.workDir.resolve(TaskRun.CMD_EXIT)
         final outFile  = task.workDir.resolve(TaskRun.CMD_OUTFILE)
         final errFile  = task.workDir.resolve(TaskRun.CMD_ERRFILE)
 
-        final List<Path> missing = [exitFile, outFile, errFile].findAll { !it.exists() } as List<Path>
-        if (missing) {
+        if (!exitFile.exists()) {
             throw new IllegalStateException(
-                "Task ${task.name}: missing expected result file(s): ${missing*.fileName.join(', ')}")
+                "Task ${task.name}: missing expected result file: ${exitFile.fileName}")
         }
+        if (!outFile.exists()) log.debug "Task ${task.name}: stdout file not found at ${outFile}"
+        if (!errFile.exists()) log.debug "Task ${task.name}: stderr file not found at ${errFile}"
     }
 
     /**
