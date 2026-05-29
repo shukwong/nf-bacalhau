@@ -120,7 +120,9 @@ job-87654321-dcba-4321-8765-210987654321
         executor.getJobGetCommand('test-job-123', workDir) >> [
             '/bin/sh',
             '-c',
-            "printf 0 > ${TaskRun.CMD_EXIT}"
+            // Plain String (not a GString): ProcessBuilder requires a String[],
+            // and a GString element triggers ArrayStoreException in start().
+            'printf 0 > ' + TaskRun.CMD_EXIT
         ]
 
         when: 'first call starts retrieval thread'
