@@ -5,7 +5,7 @@
 | Component | Version | Notes |
 |---|---|---|
 | Bacalhau CLI | 1.7.x | [Install guide](https://docs.bacalhau.org/getting-started/installation) |
-| Nextflow | 24.10.0 or later | |
+| Nextflow | 24.10.x (LTS) | Nextflow 25.x+ not yet supported; pin with `NXF_VER=24.10.0` |
 | Java | 21 (build only) | Required by the `io.nextflow.nextflow-plugin` Gradle plugin when building from source |
 | Docker | any current release | Only required if you want to run the compute node locally |
 

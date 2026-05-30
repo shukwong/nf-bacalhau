@@ -16,6 +16,8 @@ package nextflow.executor
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
+import nextflow.BuildInfo
+import nextflow.exception.AbortOperationException
 import nextflow.processor.TaskMonitor
 import nextflow.processor.TaskRun
 import nextflow.util.Duration
@@ -604,11 +606,43 @@ class BacalhauExecutor extends AbstractGridExecutor implements ExtensionPoint {
      */
     @Override
     TaskMonitor createTaskMonitor() {
+        checkNextflowVersion()
         return BacalhauTaskMonitor.create(
             session,
             name,
             BacalhauTaskMonitor.DEFAULT_POLL_INTERVAL,
             BacalhauTaskMonitor.DEFAULT_QUEUE_SIZE)
+    }
+
+    /**
+     * Highest supported Nextflow major version. The plugin is built against the
+     * Nextflow 24.10 LTS executor API.
+     */
+    protected static final int MAX_NEXTFLOW_MAJOR = 24
+
+    /**
+     * Fail fast on unsupported Nextflow versions. Nextflow 25.x removed the
+     * {@code Session.get{PollInterval,QueueSize,MonitorDumpInterval}} helpers
+     * and reworked the executor config model ({@code ExecutorConfig} /
+     * {@code TaskPollingMonitor}), so this build cannot run there — without
+     * this check it dies with a cryptic NPE deep in
+     * {@code TaskPollingMonitor.start()}. The {@code Plugin-Requires} manifest
+     * entry only enforces a lower bound, so the upper bound is enforced here.
+     */
+    protected void checkNextflowVersion() {
+        final String ver = BuildInfo.version
+        if( isUnsupportedNextflowVersion(ver) ) {
+            throw new AbortOperationException(
+                "The nf-bacalhau plugin supports Nextflow 24.10.x (LTS) but you are running ${ver}. " +
+                "Nextflow 25.x and newer are not yet supported due to executor API changes. " +
+                "Re-run with Nextflow 24.10.x, e.g. `NXF_VER=24.10.0 nextflow run ...`.")
+        }
+    }
+
+    /** True if {@code ver}'s major version exceeds the supported LTS line. */
+    protected static boolean isUnsupportedNextflowVersion(String ver) {
+        final List<String> parts = (ver ?: '').tokenize('.')
+        return parts && parts[0].isInteger() && (parts[0] as int) > MAX_NEXTFLOW_MAJOR
     }
 
     // -------------------------------------------------------------------------

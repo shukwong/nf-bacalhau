@@ -575,4 +575,20 @@ class BacalhauExecutorTest extends Specification {
         then:
         thrown(IllegalArgumentException)
     }
+
+    def 'isUnsupportedNextflowVersion flags Nextflow 25.x and newer'() {
+        expect:
+        BacalhauExecutor.isUnsupportedNextflowVersion(ver) == unsupported
+
+        where:
+        ver       | unsupported
+        '24.10.0' | false
+        '24.10.4' | false
+        '24.04.0' | false
+        '25.10.4' | true
+        '25.0.0'  | true
+        '26.04.3' | true
+        ''        | false
+        null      | false
+    }
 }

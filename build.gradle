@@ -25,6 +25,13 @@ nextflowPlugin {
     // License auto-populated from COPYING/LICENSE if present.
 }
 
+// NOTE: the plugin targets the Nextflow 24.10 LTS executor API. Nextflow 25.x
+// removed the Session config helpers and reworked ExecutorConfig /
+// TaskPollingMonitor, so it cannot run there. The `Plugin-Requires` manifest
+// entry only supports a lower bound (>=24.10.0), so the upper bound is enforced
+// at runtime by BacalhauExecutor.checkNextflowVersion(), which aborts with a
+// clear message on Nextflow 25.x+.
+
 dependencies {
     // Testing dependencies. compileOnly nextflow/pf4j/slf4j are handled by
     // the nextflow-plugin Gradle plugin.

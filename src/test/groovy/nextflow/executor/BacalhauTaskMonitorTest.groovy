@@ -33,34 +33,71 @@ class BacalhauTaskMonitorTest extends Specification {
         BacalhauTaskMonitor.DEFAULT_QUEUE_SIZE == 100
     }
 
-    def 'should create monitor with default settings'() {
+    def 'should read config via getConfig() and not the removed Session helpers'() {
+        // Nextflow 25.x removed Session.getPollInterval(String,Duration),
+        // getQueueSize(String,int) and getMonitorDumpInterval(String). The
+        // monitor must rely only on the stable getConfig() Map so the plugin
+        // loads on both 24.10 and 25.x. (Reproduces issue: NoSuchMethodError
+        // 'Session.getPollInterval' on Nextflow 25.x.)
+        given:
+        def session = Mock(Session)
+
+        when:
+        def monitor = BacalhauTaskMonitor.create(session)
+
+        then:
+        1 * session.getConfig() >> [:]
+        0 * session.getPollInterval(_, _)
+        0 * session.getQueueSize(_, _)
+        0 * session.getMonitorDumpInterval(_)
+        and:
+        monitor != null
+        monitor.getCapacity() == BacalhauTaskMonitor.DEFAULT_QUEUE_SIZE
+        monitor.getPollIntervalMillis() == BacalhauTaskMonitor.DEFAULT_POLL_INTERVAL.toMillis()
+    }
+
+    def 'should apply executor-scope overrides from config'() {
         given:
         def session = Mock(Session) {
-            getPollInterval('bacalhau', _) >> Duration.of('30sec')
-            getMonitorDumpInterval('bacalhau') >> Duration.of('5min')
-            getQueueSize('bacalhau', 100) >> 100
+            getConfig() >> [executor: [pollInterval: '45 sec', queueSize: 25, dumpInterval: '2 min']]
+        }
+
+        when:
+        def monitor = BacalhauTaskMonitor.create(
+            session, 'bacalhau',
+            BacalhauTaskMonitor.DEFAULT_POLL_INTERVAL,
+            BacalhauTaskMonitor.DEFAULT_QUEUE_SIZE)
+
+        then:
+        monitor.getCapacity() == 25
+        monitor.getPollIntervalMillis() == Duration.of('45sec').toMillis()
+    }
+
+    def 'should let the per-executor selector scope win over the global executor scope'() {
+        given:
+        def session = Mock(Session) {
+            getConfig() >> [executor: ['$bacalhau': [pollInterval: '90 sec'], pollInterval: '10 sec']]
         }
 
         when:
         def monitor = BacalhauTaskMonitor.create(session)
 
         then:
-        monitor != null
+        monitor.getPollIntervalMillis() == Duration.of('90sec').toMillis()
     }
 
-    def 'should create monitor with custom settings'() {
+    def 'should fall back to defaults when config is empty'() {
         given:
-        def customPoll = Duration.of('60sec')
         def session = Mock(Session) {
-            getPollInterval('bacalhau', customPoll) >> customPoll
-            getMonitorDumpInterval('bacalhau') >> Duration.of('5min')
-            getQueueSize('bacalhau', 50) >> 50
+            getConfig() >> null
         }
 
         when:
-        def monitor = BacalhauTaskMonitor.create(session, 'bacalhau', customPoll, 50)
+        def monitor = BacalhauTaskMonitor.create(session, 'bacalhau', Duration.of('30sec'), 100)
 
         then:
         monitor != null
+        monitor.getCapacity() == 100
+        monitor.getPollIntervalMillis() == Duration.of('30sec').toMillis()
     }
 }

@@ -37,8 +37,12 @@
   `./gradlew releasePlugin`, but the `nf-bacalhau` provider still needs to
   be claimed at <https://registry.nextflow.io/claim-plugin>. Until that
   ships, users install via `make install` (local staging).
-- **Nextflow 24.10.0 or later required.** The plugin manifest declares
-  `Plugin-Requires: >=24.10.0`; Nextflow 23.10.x refuses to load it.
+- **Nextflow 24.10.x (LTS) required.** The plugin manifest declares
+  `Plugin-Requires: >=24.10.0`, so Nextflow 23.10.x refuses to load it.
+  Nextflow **25.x and newer are not yet supported** — they removed the
+  executor config helpers this build uses, so the plugin aborts with a clear
+  message (see `BacalhauExecutor.checkNextflowVersion`). Run with 24.10.x,
+  e.g. `NXF_VER=24.10.0 nextflow run ...`. A 25.x port is planned.
 - **CLI dependency.** The executor shells out to the Bacalhau CLI; future
   work will evaluate a native client library when one becomes available.
 - **Local-path staging requires path visibility.** Local `path` inputs and the

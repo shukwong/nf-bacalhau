@@ -46,18 +46,28 @@ class BacalhauTaskMonitor extends TaskPollingMonitor {
 
     static final int DEFAULT_QUEUE_SIZE = 100
 
+    static final Duration DEFAULT_DUMP_INTERVAL = Duration.of('5min')
+
     /**
-     * Factory with explicit configuration. Overrides are sourced from the
-     * active {@link Session} so users can tune via {@code executor.pollInterval}
-     * and {@code executor.queueSize}.
+     * Factory with explicit configuration. Overrides are read from the active
+     * {@link Session}'s config map ({@code executor.pollInterval},
+     * {@code executor.queueSize}, {@code executor.dumpInterval}), with a
+     * per-executor selector scope ({@code executor.$<name>.*}) taking
+     * precedence over the global {@code executor} scope.
+     *
+     * <p>Config is read via {@link Session#getConfig()} rather than the
+     * {@code Session.getPollInterval/getQueueSize/getMonitorDumpInterval}
+     * helpers, which existed in Nextflow 24.10 but were removed in 25.x. Using
+     * only the stable config map lets a single plugin build load on both.
      */
     static BacalhauTaskMonitor create(Session session, String name, Duration defPoll, int capacity) {
         assert session
         assert name
 
-        final Duration pollInterval = session.getPollInterval(name, defPoll)
-        final Duration dumpInterval = session.getMonitorDumpInterval(name)
-        final int      queueSize    = session.getQueueSize(name, capacity)
+        final Map config = (session.getConfig() ?: [:]) as Map
+        final Duration pollInterval = asDuration(scopedValue(config, name, 'pollInterval'), defPoll)
+        final Duration dumpInterval = asDuration(scopedValue(config, name, 'dumpInterval'), DEFAULT_DUMP_INTERVAL)
+        final int      queueSize    = asInt(scopedValue(config, name, 'queueSize'), capacity)
 
         log.debug """\
             Creating BacalhauTaskMonitor
@@ -73,6 +83,55 @@ class BacalhauTaskMonitor extends TaskPollingMonitor {
             capacity: queueSize,
             pollInterval: pollInterval,
             dumpInterval: dumpInterval)
+    }
+
+    /**
+     * Resolve an executor config value from the config map. A per-executor
+     * selector scope ({@code executor.$<execName>.<key>}) overrides the global
+     * {@code executor.<key>}. Returns {@code null} when unset.
+     */
+    private static Object scopedValue(Map config, String execName, String key) {
+        final Object execObj = config?.get('executor')
+        if( !(execObj instanceof Map) )
+            return null
+        final Map exec = (Map) execObj
+        final Object scoped = exec.get('$' + execName)
+        if( scoped instanceof Map ) {
+            final Object v = ((Map) scoped).get(key)
+            if( v != null )
+                return v
+        }
+        return exec.get(key)
+    }
+
+    /** Coerce a config value (Duration or duration-string) to a Duration. */
+    private static Duration asDuration(Object value, Duration fallback) {
+        if( value == null )
+            return fallback
+        if( value instanceof Duration )
+            return (Duration) value
+        try {
+            return Duration.of(value.toString())
+        }
+        catch( Exception e ) {
+            log.warn "Invalid Bacalhau executor duration '${value}'; using ${fallback}"
+            return fallback
+        }
+    }
+
+    /** Coerce a config value (Number or numeric-string) to an int. */
+    private static int asInt(Object value, int fallback) {
+        if( value == null )
+            return fallback
+        if( value instanceof Number )
+            return ((Number) value).intValue()
+        try {
+            return Integer.parseInt(value.toString().trim())
+        }
+        catch( Exception e ) {
+            log.warn "Invalid Bacalhau executor integer '${value}'; using ${fallback}"
+            return fallback
+        }
     }
 
     /** Convenience factory using Bacalhau defaults. */
