@@ -27,7 +27,7 @@ curl http://localhost:1234/api/v1/agent/alive
 ## 2. Point Nextflow at the local node
 
 ```groovy title="nextflow.local.config"
-plugins { id 'nf-bacalhau@0.1.0-SNAPSHOT' }
+plugins { id 'nf-bacalhau@0.1.0' }
 
 bacalhau {
     bacalhauCliPath   = 'bacalhau'

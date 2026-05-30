@@ -21,7 +21,7 @@ examples/
 
 The driver:
 
-1. Verifies Docker, `bacalhau`, and Nextflow 23.10.x are present.
+1. Verifies Docker, `bacalhau`, and Nextflow 24.10+ are present.
 2. Auto-detects Java 17 (`openjdk@17` from Homebrew or `java_home -v 17`).
 3. Builds the plugin with Gradle and stages it into `~/.nextflow/plugins/`.
 4. Starts a local Bacalhau node on `:1234` with
@@ -32,7 +32,7 @@ The driver:
 
 ## What it proves
 
-- The plugin can be loaded by Nextflow 23.10.x.
+- The plugin can be loaded by Nextflow 24.10+.
 - `.command.sh` is staged into the workDir and mounted into the container.
 - The wrapper writes `.command.out`, `.command.err`, and `.exitcode` back to
   the workDir so Nextflow's TaskPollingMonitor sees completion.
