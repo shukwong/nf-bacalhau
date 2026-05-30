@@ -70,7 +70,7 @@ fi
 
 docker info >/dev/null 2>&1 || fail "Docker daemon is not running"
 
-# Nextflow 23.10.x needs Java 17. Autodetect if JAVA_HOME is not already set.
+# Nextflow runs on Java 17+. Autodetect a JDK 17 runtime if JAVA_HOME is not already set.
 if [[ -z "${JAVA_HOME:-}" ]] || [[ ! -x "${JAVA_HOME}/bin/java" ]]; then
   for candidate in \
       /opt/homebrew/opt/openjdk@17 \
@@ -137,8 +137,8 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Run the hello-world pipeline
 # ---------------------------------------------------------------------------
-# Nextflow 23.10.x does not allow `plugins {}` or `process {}` blocks inside
-# .nf files, so we write a minimal clean pipeline and use the shipped config.
+# Nextflow expects `plugins {}` and `process {}` blocks in nextflow.config,
+# not inside .nf files, so we write a minimal clean pipeline and use the shipped config.
 PIPELINE_FILE="${RUN_DIR}/hello-world.nf"
 cat >"$PIPELINE_FILE" <<'NF'
 #!/usr/bin/env nextflow
