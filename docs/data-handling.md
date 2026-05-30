@@ -6,8 +6,12 @@ can reference inputs uniformly regardless of where they came from.
 
 ## Local paths
 
-The default Nextflow `path` input. The file is staged from the workDir and
-mounted at `/inputs/<name>`.
+The default Nextflow `path` input. The staged file is mounted at
+`/inputs/<name>` as a Bacalhau `localDirectory` source.
+
+The Bacalhau compute node must be able to see the staged path directly. This
+works for local Bacalhau nodes and shared filesystems; it is not yet a general
+remote upload/staging mechanism.
 
 ```groovy
 process analyzeLocal {
@@ -18,12 +22,13 @@ process analyzeLocal {
 
 ## S3 URIs
 
-Pass an `s3://` URI as a `val`. Bacalhau's native S3 input source fetches
-the object directly on the compute node — you never download it locally.
+Pass an `s3://` URI as a `path` value recognized by Nextflow's file staging
+machinery. Bacalhau's native S3 input source fetches the object directly on
+the compute node.
 
 ```groovy
 process analyzeS3 {
-    input:  val s3_path   // "s3://my-bucket/data.csv"
+    input:  path s3_path   // "s3://my-bucket/data.csv"
     script: "process_data /inputs/data.csv"
 }
 ```
@@ -34,21 +39,20 @@ Credentials: forward the relevant env vars via `ext.bacalhauSecrets` (see
 
 ## Host paths
 
-Use the `host://` prefix to bind-mount a directory that already exists on
-the compute node — useful for large reference datasets that would be slow
-to re-stage on every job.
+Use the `host://` prefix with a path input to bind-mount a directory that
+already exists on the compute node — useful for large reference datasets that
+would be slow to re-stage on every job.
 
 ```groovy
 process analyzeLocal {
-    input:  val local_path   // "host:///data/reference_genome.fa"
+    input:  path local_path   // "host:///data/reference_genome.fa"
     script: "bwa index /inputs/reference_genome.fa"
 }
 ```
 
-Host paths are mounted **read-write** so the process can touch sidecar
-files (e.g. `bwa` index companions). Add the directory to the compute
-node's `Compute.AllowListedLocalPaths` to permit the mount — the plugin
-will not silently bypass the allowlist.
+Host paths are mounted read-only. Add the directory to the compute node's
+`Compute.AllowListedLocalPaths` to permit the mount — the plugin will not
+silently bypass the allowlist.
 
 ## Secrets
 

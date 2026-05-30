@@ -1,40 +1,34 @@
 plugins {
-    id 'java-library'
+    id 'io.nextflow.nextflow-plugin' version '1.0.0-beta.10'
     id 'groovy'
-    id 'maven-publish'
     id 'jacoco'
 }
 
-group = 'io.nextflow'
-version = '0.1.0-SNAPSHOT'
+version = '0.1.0'
 
-java {
-    sourceCompatibility = JavaVersion.VERSION_11
-    targetCompatibility = JavaVersion.VERSION_11
-}
+// -------------------------------------------------------------------------
+// Nextflow plugin metadata. Replaces the manual JAR manifest + maven-publish
+// configuration we used to ship. The `io.nextflow.nextflow-plugin` Gradle
+// plugin wires up packaging, manifest generation, and the `releasePlugin`
+// task that publishes to https://registry.nextflow.io/.
+// -------------------------------------------------------------------------
+nextflowPlugin {
+    nextflowVersion = '24.10.0'
 
-repositories {
-    mavenLocal()
-    mavenCentral()
-}
+    provider = 'nf-bacalhau'
+    className = 'nextflow.bacalhau.BacalhauPlugin'
+    extensionPoints = [
+        'nextflow.executor.BacalhauExecutor'
+    ]
 
-configurations {
-    nextflowRuntime {
-        extendsFrom runtimeClasspath
-    }
+    description = 'Nextflow executor for Bacalhau distributed compute'
+    // License auto-populated from COPYING/LICENSE if present.
 }
 
 dependencies {
-    // Nextflow core dependencies - use same Groovy version as Nextflow
-    compileOnly 'io.nextflow:nextflow:23.10.1'
-    compileOnly 'org.slf4j:slf4j-api:2.0.9'
-    
-    // Plugin framework
-    compileOnly 'org.pf4j:pf4j:3.9.0'
-    
-    // Testing dependencies
+    // Testing dependencies. compileOnly nextflow/pf4j/slf4j are handled by
+    // the nextflow-plugin Gradle plugin.
     testImplementation 'org.spockframework:spock-core:2.3-groovy-3.0'
-    testImplementation 'io.nextflow:nextflow:23.10.1'
     testImplementation 'ch.qos.logback:logback-classic:1.4.11'
     testImplementation 'net.bytebuddy:byte-buddy:1.14.9'
     testImplementation 'org.objenesis:objenesis:3.3'
@@ -84,44 +78,5 @@ jacocoTestReport {
     reports {
         xml.required = true
         html.required = true
-    }
-}
-
-compileGroovy {
-    sourceCompatibility = '11'
-    targetCompatibility = '11'
-}
-
-jar {
-    archiveBaseName = 'nf-bacalhau'
-    manifest {
-        attributes(
-            'Plugin-Class': 'nextflow.bacalhau.BacalhauPlugin',
-            'Plugin-Id': 'nf-bacalhau',
-            'Plugin-Version': version,
-            'Plugin-Provider': 'Nextflow',
-            'Plugin-Description': 'Nextflow executor for Bacalhau distributed compute'
-        )
-    }
-}
-
-publishing {
-    publications {
-        maven(MavenPublication) {
-            from components.java
-            
-            pom {
-                name = 'Nextflow Bacalhau Executor'
-                description = 'A Nextflow executor plugin for running workflows on Bacalhau'
-                url = 'https://github.com/nextflow-io/nextflow-bacalhau-executor'
-                
-                licenses {
-                    license {
-                        name = 'Apache License, Version 2.0'
-                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
-                    }
-                }
-            }
-        }
     }
 }
