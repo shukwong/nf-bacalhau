@@ -56,3 +56,7 @@ node_modules/
 out/
 coverage/
 *.tsbuildinfo
+
+# OMC (oh-my-claudecode) local agent state — never commit
+.omc/
+**/.omc/
