@@ -65,6 +65,7 @@ class BacalhauTaskHandler extends GridTaskHandler {
     // The CountDownLatch gives a happens-before edge between the retrieval
     // worker's disk writes and the polling thread reading them.
     private volatile boolean retrievalStarted = false
+    private volatile boolean retrievalRunning = false
     private volatile Future<?> retrievalFuture
     private volatile Throwable retrievalError
     private final CountDownLatch retrievalLatch = new CountDownLatch(1)
@@ -196,12 +197,15 @@ class BacalhauTaskHandler extends GridTaskHandler {
         final Future<?> f = retrievalFuture
         if (f != null && !f.isDone()) {
             f.cancel(true)   // interrupt the worker if running; drop it if still queued
-            // A retrieval cancelled while still QUEUED never runs its closure, so
-            // its finally{retrievalLatch.countDown()} is skipped and a later
-            // checkIfCompleted() would block forever. Release the latch here so
-            // completion polling reaches a terminal (failed) state. countDown()
-            // is idempotent — a running+interrupted worker also counts down.
-            retrievalLatch.countDown()
+            // Only release the latch ourselves when the retrieval was still
+            // QUEUED: its closure never runs, so its finally{countDown} won't
+            // fire and a later checkIfCompleted() would block forever. For a
+            // RUNNING retrieval, cancel(true) interrupts the worker, which sets
+            // retrievalError and counts down in its own finally — counting down
+            // here would race that and let checkIfCompleted() evaluate a killed
+            // task against partially-retrieved files (or even mark it COMPLETED).
+            if (!retrievalRunning)
+                retrievalLatch.countDown()
         }
 
         if (!bacalhauJobId) {
@@ -275,6 +279,7 @@ class BacalhauTaskHandler extends GridTaskHandler {
                         retrievalStarted = true
                         final String jobId = bacalhauJobId
                         retrievalFuture = RETRIEVAL_POOL.submit({
+                            retrievalRunning = true   // executing now — no longer merely queued
                             try {
                                 retrieveJobResults(jobId)
                             } catch (Throwable e) {

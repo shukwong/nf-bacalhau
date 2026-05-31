@@ -301,4 +301,26 @@ job-87654321-dcba-4321-8765-210987654321
         fillerDirs.each { it.deleteDir() }
         victimDir.deleteDir()
     }
+
+    def 'kill() leaves a RUNNING retrieval to release its own latch (recording the error)'() {
+        given: 'a retrieval that is running and blocked'
+        def gate = Files.createTempFile('bacalhau-rungate', '')
+        handler.@bacalhauJobId = 'j'
+        executor.getQueueStatus() >> ['j': QueueStatus.DONE]
+        executor.getJobGetCommand('j', workDir) >> ['/bin/sh', '-c',
+            'while [ -e "' + gate.toString() + '" ]; do sleep 0.05; done']
+        executor.getKillCommand() >> ['/bin/sh', '-c', 'true']
+        handler.checkIfCompleted()   // runs on a free pool thread
+        sleep 300                    // let the worker start (retrievalRunning = true)
+
+        when: 'the task is killed while its retrieval is running'
+        handler.kill()
+
+        then: 'the worker — not kill() — releases the latch, after recording the failure'
+        handler.@retrievalLatch.await(5, TimeUnit.SECONDS)
+        handler.@retrievalError != null
+
+        cleanup:
+        gate.toFile().delete()
+    }
 }
