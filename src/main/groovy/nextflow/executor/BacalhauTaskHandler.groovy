@@ -297,12 +297,18 @@ class BacalhauTaskHandler extends GridTaskHandler {
                     return false
                 }
 
-                // Latch is at zero — retrieval thread has finished and all its
-                // memory effects are visible (CountDownLatch guarantees happens-before).
-                if (retrievalError != null) {
-                    log.error "Task ${task.name}: result retrieval failed for job ${bacalhauJobId}", retrievalError
+                // Latch is at zero — the retrieval worker has finished and all
+                // its memory effects are visible (CountDownLatch happens-before).
+                // A cancelled Future means the task was killed: treat it as a
+                // failure and never evaluate it against output files, even if a
+                // partially-run retrieval happened to leave a .command.exit behind
+                // (closes the kill()-vs-start-up race on the retrieval worker).
+                final Future<?> rf = retrievalFuture
+                final boolean cancelled = rf != null && rf.isCancelled()
+                if (retrievalError != null || cancelled) {
+                    log.error "Task ${task.name}: result retrieval ${cancelled ? 'was cancelled' : 'failed'} for job ${bacalhauJobId}", retrievalError
                     markFailed(
-                        new RuntimeException("Failed to retrieve Bacalhau results for job ${bacalhauJobId}", retrievalError),
+                        new RuntimeException("Bacalhau result retrieval did not complete for job ${bacalhauJobId}", retrievalError),
                         1)
                     return true
                 }

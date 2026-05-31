@@ -323,4 +323,26 @@ job-87654321-dcba-4321-8765-210987654321
         cleanup:
         gate.toFile().delete()
     }
+
+    def 'a cancelled retrieval is failed, never evaluated against leftover output files'() {
+        given: 'a killed-while-queued retrieval: a cancelled Future and a released latch'
+        handler.@bacalhauJobId = 'j'
+        executor.getQueueStatus() >> ['j': QueueStatus.DONE]
+        def cancelled = new java.util.concurrent.FutureTask({ null } as java.util.concurrent.Callable)
+        cancelled.cancel(false)
+        handler.@retrievalStarted = true
+        handler.@retrievalFuture = cancelled
+        handler.@retrievalLatch.countDown()
+
+        and: 'a leftover exit file is present in the work dir'
+        workDir.resolve(TaskRun.CMD_EXIT).text = '0'
+
+        when: 'completion is polled after the cancellation'
+        def done = handler.checkIfCompleted()
+
+        then: 'the task is reported FAILED, not COMPLETED-success against the leftover file'
+        done
+        1 * task.setError({ it instanceof RuntimeException })
+        0 * task.setExitStatus(0)
+    }
 }
