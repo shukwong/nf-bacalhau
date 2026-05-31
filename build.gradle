@@ -59,9 +59,18 @@ sourceSets {
     }
 }
 
-configurations {
-    integrationTestImplementation.extendsFrom testImplementation
-    integrationTestRuntimeOnly.extendsFrom testRuntimeOnly
+// Integration tests drive the executor end-to-end through the bacalhau CLI and
+// examples/plink-gwas/run.sh: they shell out and never load plugin classes
+// in-JVM, so they need Spock + JUnit only, not the Nextflow runtime. Extending
+// testImplementation here dragged in io.nextflow:* whose Gradle module metadata
+// fails variant selection for this custom source set under Gradle 9.
+dependencies {
+    integrationTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    // Match the Groovy the nextflow-plugin resolves for main/test (4.0.23): its
+    // ASM reads the project's Java-21 class files. Spock alone pulls Groovy 4.0.4,
+    // whose ASM rejects class-file major version 65 (Java 21).
+    integrationTestImplementation 'org.apache.groovy:groovy:4.0.23'
+    integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
 tasks.register('integrationTest', Test) {
