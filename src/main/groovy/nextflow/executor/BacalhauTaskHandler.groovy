@@ -22,7 +22,12 @@ import nextflow.processor.TaskStatus
 import nextflow.trace.TraceRecord
 
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Task handler for managing individual Bacalhau job lifecycle.
@@ -39,12 +44,28 @@ class BacalhauTaskHandler extends GridTaskHandler {
      *  job was submitted successfully. */
     private volatile String bacalhauJobId
 
-    // Result retrieval runs on a dedicated background thread so
-    // checkIfCompleted() does not block the polling monitor for up to 5
-    // minutes per job. The CountDownLatch gives a happens-before edge between
-    // the retrieval thread's disk writes and the polling thread reading them.
+    // Result retrieval runs off the polling thread so checkIfCompleted() never
+    // blocks the monitor for up to 5 minutes per job. Retrievals run on a
+    // shared, BOUNDED pool: a daemon thread per task let threads accumulate
+    // under many concurrent completions or slow storage (`bacalhau job get`
+    // blocks up to 300 s). The fixed pool caps that — excess retrievals queue.
+    // Size is overridable via the `bacalhau.retrievalThreads` system property.
+    // (Package-private for the boundedness regression test.)
+    static final int RETRIEVAL_POOL_SIZE =
+            Math.max(1, Integer.getInteger('bacalhau.retrievalThreads', 10).intValue())
+    private static final AtomicInteger RETRIEVAL_THREAD_NUM = new AtomicInteger(1)
+    private static final ExecutorService RETRIEVAL_POOL = Executors.newFixedThreadPool(
+            RETRIEVAL_POOL_SIZE,
+            { Runnable r ->
+                final Thread t = new Thread(r, 'bacalhau-retrieve-' + RETRIEVAL_THREAD_NUM.getAndIncrement())
+                t.setDaemon(true)
+                return t
+            } as ThreadFactory)
+
+    // The CountDownLatch gives a happens-before edge between the retrieval
+    // worker's disk writes and the polling thread reading them.
     private volatile boolean retrievalStarted = false
-    private volatile Thread retrievalThread
+    private volatile Future<?> retrievalFuture
     private volatile Throwable retrievalError
     private final CountDownLatch retrievalLatch = new CountDownLatch(1)
 
@@ -172,9 +193,9 @@ class BacalhauTaskHandler extends GridTaskHandler {
      *  thread if one is currently running. */
     @Override
     void kill() {
-        final Thread t = retrievalThread
-        if (t != null && t.isAlive())
-            t.interrupt()
+        final Future<?> f = retrievalFuture
+        if (f != null && !f.isDone())
+            f.cancel(true)   // interrupts the retrieval worker if it is running
 
         if (!bacalhauJobId) {
             log.warn "Cannot kill task ${task.name}: no job ID available"
@@ -246,7 +267,7 @@ class BacalhauTaskHandler extends GridTaskHandler {
                     if (!retrievalStarted) {
                         retrievalStarted = true
                         final String jobId = bacalhauJobId
-                        final Thread t = new Thread({
+                        retrievalFuture = RETRIEVAL_POOL.submit({
                             try {
                                 retrieveJobResults(jobId)
                             } catch (Throwable e) {
@@ -254,10 +275,7 @@ class BacalhauTaskHandler extends GridTaskHandler {
                             } finally {
                                 retrievalLatch.countDown()
                             }
-                        } as Runnable, "bacalhau-retrieve-${task.name}")
-                        t.setDaemon(true)
-                        retrievalThread = t
-                        t.start()
+                        } as Runnable)
                     }
                 }
 

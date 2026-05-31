@@ -221,4 +221,38 @@ job-87654321-dcba-4321-8765-210987654321
         then:
         exitStatus == null
     }
+
+    def 'result retrieval is bounded by a shared pool, not one thread per task'() {
+        given: 'a gate file that blocks every retrieval until the test releases it'
+        def gate = Files.createTempFile('bacalhau-gate', '')
+        def poolSize = BacalhauTaskHandler.RETRIEVAL_POOL_SIZE
+        def n = poolSize + 5
+        def dirs = []
+        def handlers = (0..<n).collect { i ->
+            def wd = Files.createTempDirectory("bacalhau-bound-${i}")
+            dirs << wd
+            def t = Mock(TaskRun) { getName() >> "task-${i}"; getWorkDir() >> wd }
+            def ex = Mock(BacalhauExecutor) {
+                getQueueStatus() >> ['j': QueueStatus.DONE]
+                getJobGetCommand('j', wd) >> ['/bin/sh', '-c',
+                    'while [ -e "' + gate.toString() + '" ]; do sleep 0.02; done; printf 0 > ' + TaskRun.CMD_EXIT]
+            }
+            def h = new BacalhauTaskHandler(t, ex)
+            h.@bacalhauJobId = 'j'
+            h
+        }
+
+        when: 'all N tasks complete at once and submit their retrievals'
+        handlers.each { it.checkIfCompleted() }
+        sleep 400   // let the bounded pool saturate (retrievals stay blocked on the gate)
+
+        then: 'at most pool-size retrieval threads are alive (thread-per-task would be N)'
+        def live = Thread.allStackTraces.keySet().count { it.alive && it.name?.startsWith('bacalhau-retrieve-') }
+        live <= poolSize
+
+        cleanup: 'release the gate and drain every retrieval'
+        gate.toFile().delete()
+        handlers.each { it.@retrievalLatch.await(5, TimeUnit.SECONDS) }
+        dirs.each { it.deleteDir() }
+    }
 }
