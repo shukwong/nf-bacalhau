@@ -255,4 +255,50 @@ job-87654321-dcba-4321-8765-210987654321
         handlers.each { it.@retrievalLatch.await(5, TimeUnit.SECONDS) }
         dirs.each { it.deleteDir() }
     }
+
+    def 'kill() releases the retrieval latch even when the retrieval is still queued'() {
+        given: 'the shared pool saturated with blocked retrievals'
+        def gate = Files.createTempFile('bacalhau-killgate', '')
+        def poolSize = BacalhauTaskHandler.RETRIEVAL_POOL_SIZE
+        def fillerDirs = []
+        def fillers = (0..<poolSize).collect { i ->
+            def wd = Files.createTempDirectory("bacalhau-fill-${i}")
+            fillerDirs << wd
+            def t = Mock(TaskRun) { getName() >> "fill-${i}"; getWorkDir() >> wd }
+            def ex = Mock(BacalhauExecutor) {
+                getQueueStatus() >> ['j': QueueStatus.DONE]
+                getJobGetCommand('j', wd) >> ['/bin/sh', '-c',
+                    'while [ -e "' + gate.toString() + '" ]; do sleep 0.02; done']
+            }
+            def h = new BacalhauTaskHandler(t, ex)
+            h.@bacalhauJobId = 'j'
+            h
+        }
+        fillers.each { it.checkIfCompleted() }
+        sleep 400   // ensure every pool thread is occupied
+
+        and: 'a victim whose retrieval can only sit in the queue'
+        def victimDir = Files.createTempDirectory('bacalhau-victim')
+        def vtask = Mock(TaskRun) { getName() >> 'victim'; getWorkDir() >> victimDir }
+        def vexec = Mock(BacalhauExecutor) {
+            getQueueStatus() >> ['j': QueueStatus.DONE]
+            getJobGetCommand('j', victimDir) >> ['/bin/sh', '-c', 'printf 0 > ' + TaskRun.CMD_EXIT]
+            getKillCommand() >> ['/bin/sh', '-c', 'true']
+        }
+        def victim = new BacalhauTaskHandler(vtask, vexec)
+        victim.@bacalhauJobId = 'j'
+        victim.checkIfCompleted()   // queued behind the saturated pool
+
+        when: 'the victim is killed while its retrieval is still queued'
+        victim.kill()
+
+        then: 'its latch is released, so completion polling can reach a terminal state'
+        victim.@retrievalLatch.await(2, TimeUnit.SECONDS)
+
+        cleanup: 'release the gate and drain the fillers'
+        gate.toFile().delete()
+        fillers.each { it.@retrievalLatch.await(5, TimeUnit.SECONDS) }
+        fillerDirs.each { it.deleteDir() }
+        victimDir.deleteDir()
+    }
 }

@@ -189,13 +189,20 @@ class BacalhauTaskHandler extends GridTaskHandler {
     }
 
     /** Kill a running Bacalhau job (bounded waitFor so a hanging CLI does not
-     *  block the caller indefinitely). Also interrupts the result-retrieval
-     *  thread if one is currently running. */
+     *  block the caller indefinitely). Also cancels the result-retrieval task
+     *  (interrupting its worker if running) and releases its latch. */
     @Override
     void kill() {
         final Future<?> f = retrievalFuture
-        if (f != null && !f.isDone())
-            f.cancel(true)   // interrupts the retrieval worker if it is running
+        if (f != null && !f.isDone()) {
+            f.cancel(true)   // interrupt the worker if running; drop it if still queued
+            // A retrieval cancelled while still QUEUED never runs its closure, so
+            // its finally{retrievalLatch.countDown()} is skipped and a later
+            // checkIfCompleted() would block forever. Release the latch here so
+            // completion polling reaches a terminal (failed) state. countDown()
+            // is idempotent — a running+interrupted worker also counts down.
+            retrievalLatch.countDown()
+        }
 
         if (!bacalhauJobId) {
             log.warn "Cannot kill task ${task.name}: no job ID available"
