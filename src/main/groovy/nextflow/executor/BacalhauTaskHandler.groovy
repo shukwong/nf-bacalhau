@@ -22,7 +22,12 @@ import nextflow.processor.TaskStatus
 import nextflow.trace.TraceRecord
 
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Task handler for managing individual Bacalhau job lifecycle.
@@ -39,12 +44,29 @@ class BacalhauTaskHandler extends GridTaskHandler {
      *  job was submitted successfully. */
     private volatile String bacalhauJobId
 
-    // Result retrieval runs on a dedicated background thread so
-    // checkIfCompleted() does not block the polling monitor for up to 5
-    // minutes per job. The CountDownLatch gives a happens-before edge between
-    // the retrieval thread's disk writes and the polling thread reading them.
+    // Result retrieval runs off the polling thread so checkIfCompleted() never
+    // blocks the monitor for up to 5 minutes per job. Retrievals run on a
+    // shared, BOUNDED pool: a daemon thread per task let threads accumulate
+    // under many concurrent completions or slow storage (`bacalhau job get`
+    // blocks up to 300 s). The fixed pool caps that — excess retrievals queue.
+    // Size is overridable via the `bacalhau.retrievalThreads` system property.
+    // (Package-private for the boundedness regression test.)
+    static final int RETRIEVAL_POOL_SIZE =
+            Math.max(1, Integer.getInteger('bacalhau.retrievalThreads', 10).intValue())
+    private static final AtomicInteger RETRIEVAL_THREAD_NUM = new AtomicInteger(1)
+    private static final ExecutorService RETRIEVAL_POOL = Executors.newFixedThreadPool(
+            RETRIEVAL_POOL_SIZE,
+            { Runnable r ->
+                final Thread t = new Thread(r, 'bacalhau-retrieve-' + RETRIEVAL_THREAD_NUM.getAndIncrement())
+                t.setDaemon(true)
+                return t
+            } as ThreadFactory)
+
+    // The CountDownLatch gives a happens-before edge between the retrieval
+    // worker's disk writes and the polling thread reading them.
     private volatile boolean retrievalStarted = false
-    private volatile Thread retrievalThread
+    private volatile boolean retrievalRunning = false
+    private volatile Future<?> retrievalFuture
     private volatile Throwable retrievalError
     private final CountDownLatch retrievalLatch = new CountDownLatch(1)
 
@@ -168,13 +190,23 @@ class BacalhauTaskHandler extends GridTaskHandler {
     }
 
     /** Kill a running Bacalhau job (bounded waitFor so a hanging CLI does not
-     *  block the caller indefinitely). Also interrupts the result-retrieval
-     *  thread if one is currently running. */
+     *  block the caller indefinitely). Also cancels the result-retrieval task
+     *  (interrupting its worker if running) and releases its latch. */
     @Override
     void kill() {
-        final Thread t = retrievalThread
-        if (t != null && t.isAlive())
-            t.interrupt()
+        final Future<?> f = retrievalFuture
+        if (f != null && !f.isDone()) {
+            f.cancel(true)   // interrupt the worker if running; drop it if still queued
+            // Only release the latch ourselves when the retrieval was still
+            // QUEUED: its closure never runs, so its finally{countDown} won't
+            // fire and a later checkIfCompleted() would block forever. For a
+            // RUNNING retrieval, cancel(true) interrupts the worker, which sets
+            // retrievalError and counts down in its own finally — counting down
+            // here would race that and let checkIfCompleted() evaluate a killed
+            // task against partially-retrieved files (or even mark it COMPLETED).
+            if (!retrievalRunning)
+                retrievalLatch.countDown()
+        }
 
         if (!bacalhauJobId) {
             log.warn "Cannot kill task ${task.name}: no job ID available"
@@ -246,7 +278,8 @@ class BacalhauTaskHandler extends GridTaskHandler {
                     if (!retrievalStarted) {
                         retrievalStarted = true
                         final String jobId = bacalhauJobId
-                        final Thread t = new Thread({
+                        retrievalFuture = RETRIEVAL_POOL.submit({
+                            retrievalRunning = true   // executing now — no longer merely queued
                             try {
                                 retrieveJobResults(jobId)
                             } catch (Throwable e) {
@@ -254,10 +287,7 @@ class BacalhauTaskHandler extends GridTaskHandler {
                             } finally {
                                 retrievalLatch.countDown()
                             }
-                        } as Runnable, "bacalhau-retrieve-${task.name}")
-                        t.setDaemon(true)
-                        retrievalThread = t
-                        t.start()
+                        } as Runnable)
                     }
                 }
 
@@ -267,12 +297,18 @@ class BacalhauTaskHandler extends GridTaskHandler {
                     return false
                 }
 
-                // Latch is at zero — retrieval thread has finished and all its
-                // memory effects are visible (CountDownLatch guarantees happens-before).
-                if (retrievalError != null) {
-                    log.error "Task ${task.name}: result retrieval failed for job ${bacalhauJobId}", retrievalError
+                // Latch is at zero — the retrieval worker has finished and all
+                // its memory effects are visible (CountDownLatch happens-before).
+                // A cancelled Future means the task was killed: treat it as a
+                // failure and never evaluate it against output files, even if a
+                // partially-run retrieval happened to leave a .command.exit behind
+                // (closes the kill()-vs-start-up race on the retrieval worker).
+                final Future<?> rf = retrievalFuture
+                final boolean cancelled = rf != null && rf.isCancelled()
+                if (retrievalError != null || cancelled) {
+                    log.error "Task ${task.name}: result retrieval ${cancelled ? 'was cancelled' : 'failed'} for job ${bacalhauJobId}", retrievalError
                     markFailed(
-                        new RuntimeException("Failed to retrieve Bacalhau results for job ${bacalhauJobId}", retrievalError),
+                        new RuntimeException("Bacalhau result retrieval did not complete for job ${bacalhauJobId}", retrievalError),
                         1)
                     return true
                 }

@@ -221,4 +221,128 @@ job-87654321-dcba-4321-8765-210987654321
         then:
         exitStatus == null
     }
+
+    def 'result retrieval is bounded by a shared pool, not one thread per task'() {
+        given: 'a gate file that blocks every retrieval until the test releases it'
+        def gate = Files.createTempFile('bacalhau-gate', '')
+        def poolSize = BacalhauTaskHandler.RETRIEVAL_POOL_SIZE
+        def n = poolSize + 5
+        def dirs = []
+        def handlers = (0..<n).collect { i ->
+            def wd = Files.createTempDirectory("bacalhau-bound-${i}")
+            dirs << wd
+            def t = Mock(TaskRun) { getName() >> "task-${i}"; getWorkDir() >> wd }
+            def ex = Mock(BacalhauExecutor) {
+                getQueueStatus() >> ['j': QueueStatus.DONE]
+                getJobGetCommand('j', wd) >> ['/bin/sh', '-c',
+                    'while [ -e "' + gate.toString() + '" ]; do sleep 0.02; done; printf 0 > ' + TaskRun.CMD_EXIT]
+            }
+            def h = new BacalhauTaskHandler(t, ex)
+            h.@bacalhauJobId = 'j'
+            h
+        }
+
+        when: 'all N tasks complete at once and submit their retrievals'
+        handlers.each { it.checkIfCompleted() }
+        sleep 400   // let the bounded pool saturate (retrievals stay blocked on the gate)
+
+        then: 'at most pool-size retrieval threads are alive (thread-per-task would be N)'
+        def live = Thread.allStackTraces.keySet().count { it.alive && it.name?.startsWith('bacalhau-retrieve-') }
+        live <= poolSize
+
+        cleanup: 'release the gate and drain every retrieval'
+        gate.toFile().delete()
+        handlers.each { it.@retrievalLatch.await(5, TimeUnit.SECONDS) }
+        dirs.each { it.deleteDir() }
+    }
+
+    def 'kill() releases the retrieval latch even when the retrieval is still queued'() {
+        given: 'the shared pool saturated with blocked retrievals'
+        def gate = Files.createTempFile('bacalhau-killgate', '')
+        def poolSize = BacalhauTaskHandler.RETRIEVAL_POOL_SIZE
+        def fillerDirs = []
+        def fillers = (0..<poolSize).collect { i ->
+            def wd = Files.createTempDirectory("bacalhau-fill-${i}")
+            fillerDirs << wd
+            def t = Mock(TaskRun) { getName() >> "fill-${i}"; getWorkDir() >> wd }
+            def ex = Mock(BacalhauExecutor) {
+                getQueueStatus() >> ['j': QueueStatus.DONE]
+                getJobGetCommand('j', wd) >> ['/bin/sh', '-c',
+                    'while [ -e "' + gate.toString() + '" ]; do sleep 0.02; done']
+            }
+            def h = new BacalhauTaskHandler(t, ex)
+            h.@bacalhauJobId = 'j'
+            h
+        }
+        fillers.each { it.checkIfCompleted() }
+        sleep 400   // ensure every pool thread is occupied
+
+        and: 'a victim whose retrieval can only sit in the queue'
+        def victimDir = Files.createTempDirectory('bacalhau-victim')
+        def vtask = Mock(TaskRun) { getName() >> 'victim'; getWorkDir() >> victimDir }
+        def vexec = Mock(BacalhauExecutor) {
+            getQueueStatus() >> ['j': QueueStatus.DONE]
+            getJobGetCommand('j', victimDir) >> ['/bin/sh', '-c', 'printf 0 > ' + TaskRun.CMD_EXIT]
+            getKillCommand() >> ['/bin/sh', '-c', 'true']
+        }
+        def victim = new BacalhauTaskHandler(vtask, vexec)
+        victim.@bacalhauJobId = 'j'
+        victim.checkIfCompleted()   // queued behind the saturated pool
+
+        when: 'the victim is killed while its retrieval is still queued'
+        victim.kill()
+
+        then: 'its latch is released, so completion polling can reach a terminal state'
+        victim.@retrievalLatch.await(2, TimeUnit.SECONDS)
+
+        cleanup: 'release the gate and drain the fillers'
+        gate.toFile().delete()
+        fillers.each { it.@retrievalLatch.await(5, TimeUnit.SECONDS) }
+        fillerDirs.each { it.deleteDir() }
+        victimDir.deleteDir()
+    }
+
+    def 'kill() leaves a RUNNING retrieval to release its own latch (recording the error)'() {
+        given: 'a retrieval that is running and blocked'
+        def gate = Files.createTempFile('bacalhau-rungate', '')
+        handler.@bacalhauJobId = 'j'
+        executor.getQueueStatus() >> ['j': QueueStatus.DONE]
+        executor.getJobGetCommand('j', workDir) >> ['/bin/sh', '-c',
+            'while [ -e "' + gate.toString() + '" ]; do sleep 0.05; done']
+        executor.getKillCommand() >> ['/bin/sh', '-c', 'true']
+        handler.checkIfCompleted()   // runs on a free pool thread
+        sleep 300                    // let the worker start (retrievalRunning = true)
+
+        when: 'the task is killed while its retrieval is running'
+        handler.kill()
+
+        then: 'the worker — not kill() — releases the latch, after recording the failure'
+        handler.@retrievalLatch.await(5, TimeUnit.SECONDS)
+        handler.@retrievalError != null
+
+        cleanup:
+        gate.toFile().delete()
+    }
+
+    def 'a cancelled retrieval is failed, never evaluated against leftover output files'() {
+        given: 'a killed-while-queued retrieval: a cancelled Future and a released latch'
+        handler.@bacalhauJobId = 'j'
+        executor.getQueueStatus() >> ['j': QueueStatus.DONE]
+        def cancelled = new java.util.concurrent.FutureTask({ null } as java.util.concurrent.Callable)
+        cancelled.cancel(false)
+        handler.@retrievalStarted = true
+        handler.@retrievalFuture = cancelled
+        handler.@retrievalLatch.countDown()
+
+        and: 'a leftover exit file is present in the work dir'
+        workDir.resolve(TaskRun.CMD_EXIT).text = '0'
+
+        when: 'completion is polled after the cancellation'
+        def done = handler.checkIfCompleted()
+
+        then: 'the task is reported FAILED, not COMPLETED-success against the leftover file'
+        done
+        1 * task.setError({ it instanceof RuntimeException })
+        0 * task.setExitStatus(0)
+    }
 }
